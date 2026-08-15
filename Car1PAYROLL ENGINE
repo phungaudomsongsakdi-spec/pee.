@@ -1,0 +1,4317 @@
+// ============================================================
+//  PAYROLL ENGINE — Business Logic ทั้งหมด (แก้ไขแล้ว)
+// ============================================================
+
+const { executeQuery } = require('../db');
+const xlsx = require('xlsx');
+const ExcelJS = require('exceljs'); // ✅ ใช้ทำ Excel export ให้มีสี/สไตล์เหมือนหน้าเว็บ (xlsx เดิมใส่สีไม่ได้)
+const crypto = require('crypto');
+const fs = require('fs');
+
+// ============================================================
+//  EXCEL EXPORT STYLING — สีให้ตรงกับตาราง Reports บนหน้าเว็บ (rpt-grp-*)
+// ============================================================
+const XLSX_COLORS = {
+    id:       { header: 'FFF8FAFC', sub: 'FFF1F5F9', text: 'FF334155' },
+    d:        { header: 'FFEFF6FF', sub: 'FFDBEAFE', text: 'FF1E3A8A' },
+    n:        { header: 'FFF0FDF4', sub: 'FFDCFCE7', text: 'FF14532D' },
+    extra:    { header: 'FFFEFCE8', sub: 'FFFEF9C3', text: 'FF854D0E' },
+    flat17:   { header: 'FFFFF7ED', sub: 'FFFFEDD5', text: 'FF9A3412' },
+    night20:  { header: 'FFFDF2F8', sub: 'FFFCE7F3', text: 'FF9D174D' },
+    total:    { header: 'FFF1F5F9', text: 'FF1D4ED8' },
+    perhead:  { header: 'FFEEF2FF', sub: 'FFE0E7FF', text: 'FF3730A3' },
+};
+const XLSX_THIN_BORDER = { style: 'thin', color: { argb: 'FFE2E8F0' } };
+const XLSX_BORDER_ALL = { top: XLSX_THIN_BORDER, left: XLSX_THIN_BORDER, bottom: XLSX_THIN_BORDER, right: XLSX_THIN_BORDER };
+function xlsxFill(argb) { return { type: 'pattern', pattern: 'solid', fgColor: { argb } }; }
+// ✅ ใช้โดยรายงาน "เช็คชื่อมา/ไม่มา รายคัน" — คืนรายการวันที่ทุกวันในช่วง (รวมวันที่ไม่มีข้อมูล)
+//    เป็น string 'YYYY-MM-DD' เรียงจากน้อยไปมาก ต่างจาก dateSet ที่ทำจากข้อมูลจริง
+//    (ซึ่งจะขาดวันที่ไม่มีเที่ยวรถไปเลย ทั้งที่ตารางเช็คชื่อต้องโชว์ทุกวันในช่วงที่เลือก)
+function buildDateRange(startDate, endDate) {
+    const dates = [];
+    let cur = new Date(`${startDate}T00:00:00`);
+    const end = new Date(`${endDate}T00:00:00`);
+    while (cur <= end) {
+        const y = cur.getFullYear();
+        const m = String(cur.getMonth() + 1).padStart(2, '0');
+        const dd = String(cur.getDate()).padStart(2, '0');
+        dates.push(`${y}-${m}-${dd}`);
+        cur.setDate(cur.getDate() + 1);
+    }
+    return dates;
+}
+function xlsxUniqueSheetName(workbook, name) {
+    // ชื่อชีทห้ามเกิน 31 ตัวอักษร และห้ามมีอักขระ \/?*[]: — กันชื่อซ้ำด้วย
+    let safeName = String(name).replace(/[\\/?*[\]:]/g, '-').slice(0, 31);
+    let finalName = safeName;
+    let n = 2;
+    while (workbook.getWorksheet(finalName)) {
+        finalName = `${safeName.slice(0, 28)}(${n++})`;
+    }
+    return finalName;
+}
+
+// ⚠️ แก้บั๊ก: emp.vehicleRaw คือข้อความดิบจากไฟล์สแกน (เช่น "12A" ไม่มีขีด
+//    ตามที่พบจริงในไฟล์) แต่ Vehicles.displayNumber ในฐานข้อมูลเก็บเป็น
+//    "12-A" (มีขีด) การเทียบด้วย String().trim() ตรงๆ แบบเดิมจึงหาไม่เจอ
+//    เงียบๆ พนักงานที่ขึ้นรถเบอร์ 12A จะหลุดไป PayrollUnassignedRiders
+//    (reason: 'no_vehicle') ทั้งที่จริงมีรถอยู่ — ฟังก์ชันนี้ normalize
+//    ทั้งฝั่ง vehicleRaw และฝั่ง displayNumber ให้อยู่รูปแบบเดียวกันก่อนเทียบ
+//    (ตัวเลขล้วน -> ตัวเลข, ตัวเลข+ตัวอักษร -> "เลข-ตัวอักษร" ตัวพิมพ์ใหญ่)
+function normalizeVehicleKey(value) {
+    if (value === null || value === undefined) return '';
+    const str = String(value).trim().toUpperCase();
+    if (str === '') return '';
+    const pureNum = str.match(/^(\d+)(\.0+)?$/);
+    if (pureNum) return pureNum[1];
+    const numLetter = str.match(/^(\d+)\s*-?\s*([A-Z])$/);
+    if (numLetter) return `${numLetter[1]}-${numLetter[2]}`;
+    return str;
+}
+
+// ⚠️ แก้บั๊ก: หน้า "สร้างพนักงานจาก Unmatched" ส่ง defaultVehicleId มาเป็น
+//    ค่าจาก <select> ซึ่งควรจะเป็น id ตัวเลขของ Vehicles เสมอ แต่ในทางปฏิบัติ
+//    เจอกรณีค่าที่ส่งมาเป็นเบอร์รถแบบข้อความ (เช่น "12-A") แทน — พอเอาไป
+//    เข้าคิวรี่ `WHERE id = @id` ตรงๆ (คอลัมน์ id เป็น int) SQL Server จะ throw
+//    'Conversion failed when converting the nvarchar value ... to data type int'
+//    ทันที ทำให้ทั้ง endpoint ล่มทั้งที่ควรจะบันทึกได้ปกติ — ฟังก์ชันนี้เช็คก่อนว่า
+//    ค่าที่ส่งมาเป็นเลข id ล้วนๆ หรือไม่ ถ้าใช่ค่อย query ด้วย id ตรงๆ (เคสปกติ)
+//    ถ้าไม่ใช่ (มีตัวอักษร/ขีด ปนมา) ให้ลอง fallback ไปหาโดยเทียบ displayNumber/
+//    vehicleNumber แทน (normalize รูปแบบให้ตรงกันก่อนเทียบ เหมือนที่ทำกับ
+//    vehicleRaw ตอน import) เพื่อให้ยังบันทึกรถประจำได้ถูกคัน ไม่ error ทิ้งเฉยๆ
+async function resolveVehicleByAnyId(rawValue) {
+    if (rawValue === null || rawValue === undefined || rawValue === '') return null;
+    console.log('🔧 resolveVehicleByAnyId ได้รับค่า:', JSON.stringify(rawValue), typeof rawValue);
+
+    const isPureInt = /^\d+$/.test(String(rawValue).trim());
+    if (isPureInt) {
+        try {
+            const byId = await executeQuery(`
+                SELECT id, displayNumber, vehicleNumber FROM Vehicles WHERE id = @id
+            `, { id: parseInt(rawValue, 10) });
+            if (byId.recordset.length > 0) return byId.recordset[0];
+            return null;
+        } catch (err) {
+            // 🔧 ถ้า error เกิดตรงนี้จริง ๆ จะเห็นชัดเจนว่ามาจากบล็อก isPureInt
+            //    (ซึ่งไม่ควรเกิดขึ้นได้ เพราะ parseInt ให้ตัวเลขล้วนเสมอ)
+            console.error('🔧 resolveVehicleByAnyId (isPureInt branch) error, rawValue=', JSON.stringify(rawValue), err.message);
+            throw err;
+        }
+    }
+
+    // ไม่ใช่เลข id ล้วนๆ (เช่น "12-A") — ลองจับคู่จากเบอร์รถแทน
+    const targetKey = normalizeVehicleKey(rawValue);
+    if (!targetKey) return null;
+
+    try {
+        const all = await executeQuery(`SELECT id, displayNumber, vehicleNumber FROM Vehicles`);
+        for (const v of all.recordset) {
+            if (normalizeVehicleKey(v.displayNumber) === targetKey || normalizeVehicleKey(v.vehicleNumber) === targetKey) {
+                return v;
+            }
+        }
+        return null;
+    } catch (err) {
+        console.error('🔧 resolveVehicleByAnyId (fallback branch) error, rawValue=', JSON.stringify(rawValue), err.message);
+        throw err;
+    }
+}
+
+// ⚠️ แก้บั๊ก: Employees.defaultVehicleNumber เป็นคอลัมน์ INT ในฐานข้อมูล
+//    (ตรงกับ Vehicles.vehicleNumber ซึ่งเป็น INT เหมือนกัน) ไม่ใช่
+//    Vehicles.displayNumber ซึ่งเป็น NVARCHAR และมีตัวอักษรปนได้ เช่น "12-A"
+//    เดิมโค้ดเลือก veh.displayNumber ก่อนเสมอถ้ามีค่า ("12-A" || vehicleNumber)
+//    แล้วยัดลง query ตรงๆ ทำให้ SQL Server throw
+//    "Conversion failed when converting the nvarchar value '12-A' to data
+//    type int." ทันทีที่รถคันนั้นมีเบอร์แสดงผลไม่ใช่ตัวเลขล้วน — ตอนนี้ใช้
+//    vehicleNumber (int) เป็นหลักตามชนิดคอลัมน์จริง, fallback ไป displayNumber
+//    เฉพาะกรณีบังเอิญเป็นตัวเลขล้วน (เช่น "7") เท่านั้น ถ้าไม่มีทั้งคู่ที่เป็น
+//    ตัวเลขได้ (เช่นมีแต่ "12-A") ให้เป็น null แทนที่จะทำให้ทั้ง request ล้มเหลว
+//    (defaultVehicleId ที่ resolveVehicleByAnyId คืนมายังคงชี้รถถูกคันเสมอ
+//    ไม่ว่า defaultVehicleNumber จะบันทึกได้หรือไม่ก็ตาม)
+function safeVehicleNumberForColumn(veh) {
+    if (!veh) return null;
+    if (veh.vehicleNumber !== null && veh.vehicleNumber !== undefined && veh.vehicleNumber !== '') {
+        const n = parseInt(veh.vehicleNumber, 10);
+        if (!isNaN(n)) return n;
+    }
+    if (veh.displayNumber && /^\d+$/.test(String(veh.displayNumber).trim())) {
+        return parseInt(veh.displayNumber, 10);
+    }
+    return null;
+}
+
+class PayrollEngine {
+
+    // ตั้งค่ารอบมาตรฐานเมื่อฐานข้อมูลยังไม่มีรอบเลย เพื่อไม่ให้ไฟล์ที่
+    // นำเข้าแล้วถูกจับคู่สำเร็จ แต่ไม่มีรอบรถสำหรับแสดงผล
+    static async ensureDefaultShiftTypes() {
+        const existing = await executeQuery('SELECT COUNT(*) AS count FROM PayrollShiftTypes');
+        if (Number(existing.recordset[0]?.count || 0) > 0) return;
+
+        const defaults = [
+            ['D', 'เข้าเช้า', '06:00', '07:59', 'perHead', 0, 1],
+            ['N', 'ออกกะ', '08:00', '09:00', 'perHead', 0, 2],
+            ['EVENING_IN_16', 'เข้า 16:00', '15:00', '15:59', 'perHead', 0, 3],
+            ['EVENING_OUT_16', 'ออก 16:00', '16:00', '16:30', 'perHead', 0, 4],
+            ['EVENING_17', '17:00', '16:30', '17:30', 'flatByVehicle', 300, 5],
+            ['NIGHT_20', '20:00', '19:00', '20:59', 'perTrip', 0, 6]
+        ];
+
+        for (const [shiftCode, shiftName, startTime, endTime, fareType, defaultRate, displayOrder] of defaults) {
+            await executeQuery(`
+                INSERT INTO PayrollShiftTypes
+                    (shiftCode, shiftName, startTime, endTime, fareType, defaultRate, isActive, displayOrder)
+                SELECT @shiftCode, @shiftName, @startTime, @endTime, @fareType, @defaultRate, 1, @displayOrder
+                WHERE NOT EXISTS (SELECT 1 FROM PayrollShiftTypes WHERE shiftCode = @shiftCode)
+            `, { shiftCode, shiftName, startTime, endTime, fareType, defaultRate, displayOrder });
+        }
+    }
+    
+    // ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── ───
+    //  1. IMPORT EXCEL
+    // ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── ───
+    static async importExcel(filePath, filename, importedBy, sourceType = 'employee_file') {
+        const workbook = xlsx.readFile(filePath);
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        const rawData = xlsx.utils.sheet_to_json(sheet, { defval: '', raw: false });
+
+        if (!rawData || rawData.length === 0) {
+            throw new Error('ไฟล์ว่างเปล่า');
+        }
+
+        const headers = Object.keys(rawData[0]);
+        console.log('📋 Headers:', headers);
+
+        if (sourceType === 'driver_file') {
+            const required = ['วันที่', 'เวลา', 'รหัสบัตรรูด', 'ชื่อ', 'นามสกุล'];
+            const missing = required.filter(r => !headers.some(h => h.includes(r) || r.includes(h)));
+            if (missing.length > 0) {
+                throw new Error(`ไฟล์คนขับไม่ถูกต้อง: ขาดคอลัมน์ ${missing.join(', ')}`);
+            }
+            return await this.importDriverFile(rawData, filename, importedBy);
+        }
+
+        const colMap = {
+            date: this.findColumn(headers, ['วันที่', 'Date', 'date']),
+            time: this.findColumn(headers, ['เวลา', 'Time', 'time']),
+            cardId: this.findColumn(headers, ['รหัสบัตร', 'รหัสบัตรรูด', 'cardId', 'Card ID']),
+            name: this.findColumn(headers, ['ชื่อ', 'ชื่อ-นามสกุล', 'Full Name', 'Name']),
+            lastName: this.findColumn(headers, ['นามสกุล', 'Last Name', 'LastName']),
+            department: this.findColumn(headers, ['แผนก', 'Department', 'ส่วน']),
+            vehicle: this.findColumn(headers, ['สายรถ', 'เบอร์รถ', 'รถ', 'Route', 'vehicle']),
+            fare: this.findColumn(headers, ['ค่ารถ', 'Fare', 'ค่าโดยสาร']),
+            shift: this.findColumn(headers, ['กะงาน', 'shift', 'รอบ']),
+            destination: this.findColumn(headers, ['จุดหมาย', 'สถานที่', 'Address', 'destination']),
+        };
+
+        if (!colMap.cardId) {
+            throw new Error('ไม่พบคอลัมน์รหัสบัตร (cardId)');
+        }
+
+        const importResult = await executeQuery(`
+            INSERT INTO PayrollScanImports (filename, importedBy, totalRows, status, sourceType)
+            OUTPUT INSERTED.id
+            VALUES (@filename, @importedBy, @totalRows, 'pending', @sourceType)
+        `, {
+            filename,
+            importedBy: importedBy || 'system',
+            totalRows: rawData.length,
+            sourceType: sourceType || 'employee_file'
+        });
+
+        const importId = importResult.recordset[0].id;
+
+        let rowIndex = 0;
+        for (const row of rawData) {
+            rowIndex++;
+            const cardId = colMap.cardId ? String(row[colMap.cardId] || '').trim() : '';
+            if (!cardId) continue;
+
+            const scanDate = this.parseDate(colMap.date ? row[colMap.date] : null);
+            const scanTime = this.parseTime(colMap.time ? row[colMap.time] : null);
+            const fareRaw = colMap.fare ? String(row[colMap.fare] || '').trim() : '';
+            const shiftRaw = colMap.shift ? String(row[colMap.shift] || '').trim() : '';
+
+            await executeQuery(`
+                INSERT INTO PayrollScanRows (
+                    importId, rowIndex, scanDate, scanTime, cardId,
+                    firstName, lastName, departmentRaw, vehicleRaw,
+                    fareRaw, shiftRaw, destinationRaw, 
+                    sourceType, processedStatus
+                ) VALUES (
+                    @importId, @rowIndex, @scanDate, @scanTime, @cardId,
+                    @firstName, @lastName, @departmentRaw, @vehicleRaw,
+                    @fareRaw, @shiftRaw, @destinationRaw,
+                    @sourceType, 'pending'
+                )
+            `, {
+                importId,
+                rowIndex,
+                scanDate,
+                scanTime,
+                cardId,
+                firstName: colMap.name ? String(row[colMap.name] || '').trim() : '',
+                lastName: colMap.lastName ? String(row[colMap.lastName] || '').trim() : '',
+                departmentRaw: colMap.department ? String(row[colMap.department] || '').trim() : '',
+                vehicleRaw: colMap.vehicle ? String(row[colMap.vehicle] || '').trim() : '',
+                fareRaw,
+                shiftRaw,
+                destinationRaw: colMap.destination ? String(row[colMap.destination] || '').trim() : '',
+                sourceType: sourceType || 'employee_file'
+            });
+        }
+
+        return { importId, totalRows: rawData.length, status: 'pending' };
+    }
+
+    // ─── IMPORT DRIVER FILE ───
+    static async importDriverFile(fileRows, filename, importedBy) {
+        const importResult = await executeQuery(`
+            INSERT INTO PayrollScanImports (filename, importedBy, totalRows, status, sourceType)
+            OUTPUT INSERTED.id
+            VALUES (@filename, @importedBy, @totalRows, 'pending', 'driver_file')
+        `, {
+            filename,
+            importedBy: importedBy || 'system',
+            totalRows: fileRows.length
+        });
+
+        const importId = importResult.recordset[0].id;
+
+        for (const row of fileRows) {
+            const scanDate = this.parseDate(row['วันที่']);
+            const scanTime = row['เวลา'] ? this.parseTime(row['เวลา']) : null;
+            const cardId = String(row['รหัสบัตรรูด'] || '').trim();
+            if (!cardId) continue;
+
+            await executeQuery(`
+                INSERT INTO PayrollScanRows (
+                    importId, scanDate, scanTime, cardId, 
+                    firstName, lastName, terminalRaw,
+                    sourceType, processedStatus
+                ) VALUES (
+                    @importId, @scanDate, @scanTime, @cardId,
+                    @firstName, @lastName, @terminalRaw,
+                    'driver_file', 'pending'
+                )
+            `, {
+                importId,
+                scanDate,
+                scanTime,
+                cardId,
+                firstName: row['ชื่อ'] || '',
+                lastName: row['นามสกุล'] || '',
+                terminalRaw: row['ชื่อเครื่อง'] || null
+            });
+        }
+
+        return { importId, totalRows: fileRows.length, status: 'pending' };
+    }
+
+    // ─── PROCESS IMPORT ───
+    static async processImport(importId, force = false) {
+        await this.ensureDefaultShiftTypes();
+
+        if (force) {
+            const importDates = await executeQuery(`
+                SELECT DISTINCT CAST(scanDate AS DATE) AS operationDate
+                FROM PayrollScanRows
+                WHERE importId = @importId AND scanDate IS NOT NULL
+            `, { importId });
+
+            for (const row of importDates.recordset) {
+                const operationDate = row.operationDate;
+                await executeQuery(`
+                    DELETE te
+                    FROM PayrollTripEmployees te
+                    INNER JOIN PayrollVehicleTrips vt ON vt.id = te.vehicleTripId
+                    WHERE vt.operationDate = @operationDate AND vt.createdBy = 'system'
+                `, { operationDate });
+                await executeQuery(`
+                    DELETE FROM PayrollVehicleTrips
+                    WHERE operationDate = @operationDate AND createdBy = 'system'
+                `, { operationDate });
+                await executeQuery(`
+                    DELETE FROM PayrollUnassignedRiders WHERE operationDate = @operationDate
+                `, { operationDate });
+            }
+
+            await executeQuery(`
+                UPDATE PayrollScanRows
+                SET processedStatus = 'pending', personType = NULL,
+                    matchedEmployeeId = NULL, matchedDriverId = NULL
+                WHERE importId = @importId
+            `, { importId });
+        }
+
+        await executeQuery(`
+            UPDATE PayrollScanImports SET status = 'processing' WHERE id = @importId
+        `, { importId });
+
+        // ⚠️ แก้บั๊ก: เดิม WHERE processedStatus = 'pending' เท่านั้น — แถวที่เคย
+        //    ถูกจัดเป็น 'unmatched' ไปแล้ว (หา cardId ไม่เจอใน Employees ตอนนั้น)
+        //    จะไม่ถูกดึงมาอีกเลยแม้จะกด "ประมวลผล" ซ้ำ ทั้งที่ระหว่างนั้นแอดมิน
+        //    อาจไปเพิ่ม/แก้พนักงานคนนั้นในระบบจัดการพนักงานแล้วก็ตาม (cardId ตรง
+        //    กันแล้ว) — ตอนนี้ดึงแถว 'unmatched' มาลองจับคู่ใหม่ทุกครั้งที่กด
+        //    ประมวลผลด้วย ไม่ต้องกด force reprocess (ซึ่งลบเที่ยวรถทิ้งทั้งหมด)
+        //    แค่เพื่อให้คนที่เพิ่งเพิ่มเข้าระบบถูกจับคู่ย้อนหลัง
+        const rows = await executeQuery(`
+            SELECT * FROM PayrollScanRows 
+            WHERE importId = @importId AND processedStatus IN ('pending', 'unmatched')
+        `, { importId });
+
+        if (rows.recordset.length === 0) {
+            await executeQuery(`
+                UPDATE PayrollScanImports SET status = 'completed' WHERE id = @importId
+            `, { importId });
+            return { importId, processed: 0, matchedRows: 0, unmatchedRows: 0 };
+        }
+// ✅ ดึง Employees + Vehicles
+const employees = await executeQuery(`
+    SELECT * FROM Employees WHERE status = 'active'
+`);
+
+// ✅ ดึงเฉพาะคนขับ (isDriver = 1)
+const drivers = await executeQuery(`
+    SELECT * FROM Employees WHERE status = 'active' AND isDriver = 1
+`);
+
+const vehicles = await executeQuery(`
+    SELECT * FROM Vehicles WHERE status = 'active'
+`);
+
+console.log('📋 employees.recordset มีกี่คน:', employees.recordset.length);
+console.log('📋 drivers.recordset มีกี่คน:', drivers.recordset.length);
+console.log('📋 vehicles.recordset มีกี่คน:', vehicles.recordset.length);
+        // ✅ สร้าง Maps
+        const employeeMap = {};
+        for (const e of employees.recordset) {
+            if (e.cardId) employeeMap[e.cardId.trim()] = e;
+        }
+
+        // ✅ สร้าง driverMap โดยใช้ cardId เป็น key (จาก Employees โดยตรง)
+        // ⚠️ แก้บั๊ก (รอบ 2): เดิมหารถประจำของคนขับจาก Employees.defaultVehicleId
+        //    ซึ่งเป็นค่านิ่งที่ตั้งครั้งเดียวตอนสร้างพนักงาน — แต่หน้า "กำหนดคนขับรถ"
+        //    ในระบบจัดการยานพาหนะ (ที่แอดมินใช้จริงตอนเปลี่ยน/เพิ่มคนขับ) ไปอัปเดต
+        //    คนละตาราง (VehicleDriverMap) ไม่เคยย้อนไปอัปเดต defaultVehicleId เลย
+        //    ผลคือพอแอดมินเปลี่ยนคนขับผ่านหน้ายานพาหนะ payrollEngine ยังคำนวณด้วย
+        //    คนขับคนเก่าอยู่ (อ่าน defaultVehicleId ที่ไม่มีใครอัปเดตตาม)
+        //    ตอนนี้ดึงคู่ "รถ ↔ คนขับปัจจุบัน" จาก VehicleDriverMap โดยตรง
+        //    (isDeleted = 0 = แถวที่ยัง active อยู่จริง, ไม่ใช่ประวัติเก่าที่ถูกแทนที่แล้ว)
+        //    ให้ตรงกับสิ่งที่แอดมินเห็น/ตั้งค่าในหน้า "กำหนดคนขับรถ" เป๊ะๆ
+        const vehicleDriverMapResult = await executeQuery(`
+            SELECT vdm.vehicleId, vdm.cardId, v.vehicleNumber, v.displayNumber, v.plate
+            FROM VehicleDriverMap vdm
+            INNER JOIN Vehicles v ON v.id = vdm.vehicleId
+            WHERE vdm.isDeleted = 0
+            ORDER BY vdm.effectiveFrom ASC, vdm.updatedAt ASC
+        `);
+        const vehicleByDriverCardId = {};
+        for (const row of vehicleDriverMapResult.recordset) {
+            // ✅ ORDER BY ... ASC + loop overwrite ทับท้าย ๆ = ถ้า cardId เดียวกันมีมากกว่า 1
+            //    แถว active พร้อมกัน (ข้อมูลเก่าที่ไม่ครบ) จะได้แถวที่ effectiveFrom/updatedAt
+            //    ล่าสุดชนะเสมอ ไม่ใช่แถวไหนก็ได้ตามลำดับที่ SQL Server บังเอิญคืนมา
+            if (row.cardId) vehicleByDriverCardId[row.cardId.trim()] = row;
+        }
+        console.log('📋 VehicleDriverMap (active) มีกี่คู่:', vehicleDriverMapResult.recordset.length);
+
+const driverMap = {};
+for (const e of drivers.recordset) {
+    if (e.cardId && e.cardId.trim() !== '') {
+        const vehicle = vehicleByDriverCardId[e.cardId.trim()] || null;
+        driverMap[e.cardId.trim()] = {
+            employeeId: e.id,
+            cardId: e.cardId,
+            driverName: e.name,
+            defaultVehicleId: e.defaultVehicleId, // เก็บไว้เฉยๆ เผื่ออ้างอิง/debug ไม่ใช้จับคู่รถแล้ว
+            vehicleId: vehicle ? vehicle.vehicleId : null,
+            vehicleNumber: vehicle ? vehicle.vehicleNumber : null,
+            displayNumber: vehicle ? vehicle.displayNumber : null,
+            plate: vehicle ? vehicle.plate : null,
+        };
+    }
+}
+
+console.log('✅ driverMap สร้างเสร็จ มีกี่คน:', Object.keys(driverMap).length);
+console.log('🔍 driverMap keys:', Object.keys(driverMap));
+
+        // ✅ Group by date
+        const dateGroups = {};
+        for (const row of rows.recordset) {
+            let dateKey = row.scanDate;
+            
+            if (dateKey instanceof Date) {
+                const year = dateKey.getFullYear();
+                const month = String(dateKey.getMonth() + 1).padStart(2, '0');
+                const day = String(dateKey.getDate()).padStart(2, '0');
+                dateKey = `${year}-${month}-${day}`;
+            }
+            else if (typeof dateKey === 'string' && dateKey.includes(' ')) {
+                const parts = dateKey.split(' ');
+                const datePart = parts[0];
+                if (datePart.includes('-')) {
+                    dateKey = datePart;
+                }
+                else if (datePart.includes('/')) {
+                    const dParts = datePart.split('/');
+                    if (dParts.length === 3) {
+                        const month = dParts[0].padStart(2, '0');
+                        const day = dParts[1].padStart(2, '0');
+                        let year = dParts[2];
+                        if (year.length === 2) year = 2000 + parseInt(year);
+                        if (parseInt(year) > 2400) year = parseInt(year) - 543;
+                        dateKey = `${year}-${month}-${day}`;
+                    }
+                }
+            }
+            else if (typeof dateKey === 'string' && dateKey.includes('/')) {
+                const dParts = dateKey.split('/');
+                if (dParts.length === 3) {
+                    const month = dParts[0].padStart(2, '0');
+                    const day = dParts[1].padStart(2, '0');
+                    let year = dParts[2];
+                    if (year.length === 2) year = 2000 + parseInt(year);
+                    if (parseInt(year) > 2400) year = parseInt(year) - 543;
+                    dateKey = `${year}-${month}-${day}`;
+                }
+            }
+            else if (typeof dateKey === 'string' && dateKey.includes('-')) {
+                const parts = dateKey.split('-');
+                if (parts.length === 3) {
+                    let year = parts[0];
+                    let month = parts[1].padStart(2, '0');
+                    let day = parts[2].padStart(2, '0');
+                    if (day.length > 2) day = day.substring(0, 2);
+                    if (parseInt(year) > 2400) year = parseInt(year) - 543;
+                    dateKey = `${year}-${month}-${day}`;
+                }
+            }
+            else {
+                const now = new Date();
+                const year = now.getFullYear();
+                const month = String(now.getMonth() + 1).padStart(2, '0');
+                const day = String(now.getDate()).padStart(2, '0');
+                dateKey = `${year}-${month}-${day}`;
+            }
+
+            if (!dateGroups[dateKey]) dateGroups[dateKey] = [];
+            dateGroups[dateKey].push(row);
+        }
+
+        let matchedRows = 0;
+        let unmatchedRows = 0;
+
+        // ✅ ประมวลผลแต่ละวัน
+        for (const [date, dayRows] of Object.entries(dateGroups)) {
+            const result = await this.processDay(date, employeeMap, driverMap);
+            matchedRows += result.matched || 0;
+            unmatchedRows += result.unmatched || 0;
+            
+            for (const row of dayRows) {
+                await executeQuery(`
+                    UPDATE PayrollScanRows SET processedStatus = 'matched'
+                    WHERE id = @id
+                `, { id: row.id });
+            }
+        }
+
+        // ✅ ย้าย Unmatched
+        const unmatchedRowsData = await executeQuery(`
+            SELECT * FROM PayrollScanRows 
+            WHERE importId = @importId AND personType = 'unmatched'
+        `, { importId });
+
+        for (const row of unmatchedRowsData.recordset) {
+            const cardId = row.cardId ? row.cardId.trim() : '';
+
+            // ✅ กันซ้ำด้วย cardId (คนเดิม ไม่ว่าจะ unmatched กี่วัน/กี่รอบ ก็ขึ้น pending list แค่ 1 แถว)
+            //    ถ้าไม่มี cardId เลย (ข้อมูลดิบไม่มีรหัสบัตรมาด้วย) ใช้ scanRowId แทนเป็นกรณีพิเศษ
+            const exist = cardId
+                ? await executeQuery(`
+                    SELECT id FROM PayrollUnmatchedPersons WHERE cardId = @cardId AND status = 'pending'
+                `, { cardId })
+                : await executeQuery(`
+                    SELECT id FROM PayrollUnmatchedPersons WHERE scanRowId = @scanRowId
+                `, { scanRowId: row.id });
+
+            if (exist.recordset.length === 0) {
+                await executeQuery(`
+                    INSERT INTO PayrollUnmatchedPersons (
+                        scanRowId, cardId, firstName, lastName,
+                        departmentRaw, vehicleRaw, shiftRaw, status
+                    ) VALUES (
+                        @scanRowId, @cardId, @firstName, @lastName,
+                        @departmentRaw, @vehicleRaw, @shiftRaw, 'pending'
+                    )
+                `, {
+                    scanRowId: row.id,
+                    cardId: row.cardId || '',
+                    firstName: row.firstName || '',
+                    lastName: row.lastName || '',
+                    departmentRaw: row.departmentRaw || '',
+                    vehicleRaw: row.vehicleRaw || '',
+                    shiftRaw: row.shiftRaw || ''
+                });
+            }
+            // ถ้ามีอยู่แล้ว (pending) ไม่ต้อง insert ซ้ำ — scanRow แถวนี้จะถูกจับคู่ย้อนหลังทีเดียว
+            // ตอนกด "สร้างพนักงาน" ใน createEmployeeFromUnmatched (อัปเดตทุกแถวที่ cardId ตรงกัน ไม่ใช่แค่แถวเดียว)
+        }
+
+        // ✅ แก้บั๊ก: เดิม COUNT(*) นี้ไม่มี WHERE status ('pending') เลย นับรวม
+        //    ทุกแถวที่เคยถูกสร้างใน PayrollUnmatchedPersons ตลอดประวัติศาสตร์
+        //    รวมของที่ถูกจัดการไปแล้ว (สร้างพนักงานแล้ว/กดข้ามแล้ว) ด้วย ผลคือ
+        //    ยอด "Unmatched" ที่โชว์หลังกด "ประมวลผล" (การ์ดสรุป/ประวัติการนำเข้า)
+        //    ไม่ตรงกับแท็บ "Unmatched" จริงที่กรอง status = 'pending' อยู่แล้ว
+        //    (เช่น เหลือ pending จริง 9 คน แต่การ์ดสรุปขึ้น 14 ซึ่งเป็นยอดสะสมเก่า)
+        //    ตอนนี้กรอง status = 'pending' ให้ตรงกับที่แท็บ Unmatched ใช้จริง
+        const unmatchedCount = await executeQuery(`
+            SELECT COUNT(*) as cnt FROM PayrollUnmatchedPersons WHERE status = 'pending'
+        `);
+
+        await executeQuery(`
+            UPDATE PayrollScanImports SET 
+                status = 'completed',
+                processedRows = @processedRows,
+                matchedRows = @matchedRows,
+                unmatchedRows = @unmatchedRows
+            WHERE id = @importId
+        `, { 
+            importId, 
+            processedRows: rows.recordset.length, 
+            matchedRows, 
+            unmatchedRows: unmatchedCount.recordset[0]?.cnt || 0
+        });
+
+        return { 
+            importId, 
+            processed: rows.recordset.length, 
+            matchedRows, 
+            unmatchedRows: unmatchedCount.recordset[0]?.cnt || 0
+        };
+    }
+
+ // ─── PROCESS DAY ───
+static async processDay(date, employeeMap, driverMap) {
+    const allRows = await executeQuery(`
+        SELECT * FROM PayrollScanRows 
+        WHERE scanDate = @date 
+        AND sourceType IN ('employee_file', 'driver_file')
+    `, { date });
+
+    const rowsList = allRows.recordset || [];
+
+    if (rowsList.length === 0) {
+        console.log(`⚠️ วันที่ ${date}: ไม่มีข้อมูล`);
+        return { matched: 0, unmatched: 0, warnings: ['ไม่มีข้อมูล'] };
+    }
+
+    // ⚠️ แก้บั๊ก (คู่กับ processImport ด้านบน): เดิมกรองแค่ 'pending' ทำให้แถวที่
+    //    เคยหา cardId ไม่เจอ (processedStatus = 'unmatched') ไม่เคยถูกลองจับคู่
+    //    ใหม่อีกเลย ต่อให้พนักงานคนนั้นถูกเพิ่ม/แก้ไขให้ cardId ตรงกันในภายหลัง
+    //    ก็ตาม ต้องกด force reprocess (ลบเที่ยวรถทิ้งทั้งวันแล้วสร้างใหม่) เท่านั้น
+    //    ตอนนี้รวม 'unmatched' เข้ามาลองจับคู่ใหม่ทุกครั้งที่มีการประมวลผลวันนั้น
+    const pendingRows = rowsList.filter(r => r.processedStatus === 'pending' || r.processedStatus === 'unmatched');
+    const alreadyProcessed = rowsList.filter(r => r.processedStatus === 'matched');
+
+    console.log(`📅 Processing day: ${date}, ทั้งหมด ${rowsList.length} แถว (pending/unmatched ที่จะลองจับคู่ใหม่: ${pendingRows.length}, matched อยู่แล้ว: ${alreadyProcessed.length})`);
+
+    if (pendingRows.length === 0) {
+        console.log(`   ✅ ทุกอย่างถูกประมวลผลแล้ว`);
+        return { matched: 0, unmatched: 0, warnings: [] };
+    }
+
+    // ✅ Classify pending rows
+    const classified = await this.classifyRows(pendingRows, employeeMap, driverMap);
+
+    const newEmployees = classified.employees || [];
+    const newDrivers = classified.drivers || [];
+    const unmatched = classified.unmatched || [];
+
+    console.log(`   👤 Employees (ใหม่): ${newEmployees.length}`);
+    console.log(`   🚗 Drivers (ใหม่): ${newDrivers.length}`);
+    console.log(`   ❓ Unmatched: ${unmatched.length}`);
+
+    // ✅ ดึงข้อมูลที่มีอยู่แล้วในวันนี้ (จาก PayrollScanRows ทั้งหมด)
+    const allRowsInDate = await executeQuery(`
+        SELECT 
+            cardId,
+            firstName,
+            lastName,
+            departmentRaw,
+            vehicleRaw,
+            fareRaw,
+            shiftRaw,
+            scanTime,
+            sourceType,
+            processedStatus,
+            personType
+        FROM PayrollScanRows 
+        WHERE scanDate = @date 
+        AND sourceType IN ('employee_file', 'driver_file')
+    `, { date });
+
+    const existingEmployees = [];
+    const existingDrivers = [];
+
+    // ⚠️ แก้บั๊ก: เดิม lookup driverMap[row.cardId] / employeeMap[row.cardId] ตรงนี้
+    //    ไม่ trim() ก่อนเลย ทั้งที่ driverMap/employeeMap ถูกสร้างด้วย key ที่ trim()
+    //    แล้ว (และ classifyRows() ที่ใช้กับแถวใหม่ก็ trim() ก่อน lookup ทุกครั้ง)
+    //    ผลคือถ้า cardId ในฐานข้อมูลมีช่องว่างเกินมาแม้แต่ตัวเดียว แถวนั้นจะ
+    //    หลุดจาก existingDrivers/existingEmployees แบบเงียบๆ — ไม่มีผลตอน import
+    //    ครั้งแรก (เพราะ newDrivers/newEmployees จาก classifyRows ที่ trim() ถูก
+    //    ครอบคลุมทุกคนอยู่แล้ว) แต่พอมีวันที่ import ซ้ำ/แยกไฟล์ (เช่น import
+    //    ไฟล์พนักงานซ้ำอีกรอบ โดยไม่มีแถวคนขับใหม่เลยในรอบนั้น) existingDrivers
+    //    (ที่พึ่งพา lookup ตัวนี้ล้วนๆ) จะว่างเปล่า ทำให้พนักงานทุกคนที่มีรถแล้ว
+    //    แต่หาคนขับไม่เจอ ถูกเหวี่ยงไปกอง "ยังไม่ถูกจัดขึ้นรถ" (no_driver_scan)
+    //    ทั้งที่จริงๆ ถูกจัดรถถูกต้องอยู่แล้วจากรอบก่อนหน้า — ตอนนี้ trim() ให้ตรงกัน
+    for (const row of allRowsInDate.recordset) {
+        const rowCardId = row.cardId ? row.cardId.trim() : '';
+        if (row.personType === 'driver' || row.sourceType === 'driver_file') {
+            const driverInfo = driverMap[rowCardId];
+            if (driverInfo) {
+                existingDrivers.push({
+                    cardId: row.cardId,
+                    name: `${row.firstName} ${row.lastName}`.trim(),
+                    scanTime: row.scanTime,
+                    vehicleId: driverInfo.vehicleId,
+                    vehicleDisplayNumber: driverInfo.displayNumber,
+                    plate: driverInfo.plate,
+                    personType: 'driver'
+                });
+            }
+        } else if (row.personType === 'employee' || row.sourceType === 'employee_file') {
+            const empInfo = employeeMap[rowCardId];
+            if (empInfo) {
+                existingEmployees.push({
+                    cardId: row.cardId,
+                    firstName: row.firstName,
+                    lastName: row.lastName,
+                    scanTime: row.scanTime,
+                    fareRaw: row.fareRaw,
+                    vehicleRaw: row.vehicleRaw,
+                    employee: empInfo,
+                    personType: 'employee'
+                });
+            }
+        }
+    }
+
+    // ✅ รวมข้อมูลใหม่ + ข้อมูลที่มีอยู่แล้ว
+    const allEmployees = [...newEmployees, ...existingEmployees];
+    const allDrivers = [...newDrivers, ...existingDrivers];
+
+    // ✅ เอาคนขับที่ซ้ำออก
+    // ⚠️ แก้บั๊ก: เดิม dedupe ด้วย cardId อย่างเดียว — คนขับ 1 คนที่สแกน
+    //    หลายรอบต่อวัน (เช้า + 20:00) จะเหลือแค่ scan แรกที่เจอ แล้ว scan
+    //    รอบอื่นๆ ของคนคนเดิมหายไปเงียบๆ ทำให้ classifyByShift จัดเขาเข้า
+    //    ได้แค่รอบเดียว (มักเป็นรอบเช้าที่มาก่อนตามลำดับข้อมูล) ทั้งที่ควร
+    //    ปรากฏในทุกรอบที่เขาสแกนจริง — ตอนนี้ dedupe ด้วย cardId+scanTime
+    //    แทน เพื่อกันเฉพาะแถวที่ซ้ำกันจริง (จาก newDrivers/existingDrivers
+    //    ที่ query ทับกัน) แต่ยังเก็บสแกนคนละเวลาของคนขับคนเดิมไว้ครบ
+    const uniqueDrivers = [];
+    const seenDriverKeys = new Set();
+    for (const d of allDrivers) {
+        const key = `${d.cardId}|${this.toHHMM(d.scanTime)}`;
+        if (!seenDriverKeys.has(key)) {
+            seenDriverKeys.add(key);
+            uniqueDrivers.push(d);
+        }
+    }
+
+    // ✅ เอาพนักงานที่ซ้ำออก (เหตุผลเดียวกับคนขับด้านบน — dedupe ด้วย
+    //    cardId+scanTime แทน cardId เฉยๆ เผื่อพนักงานสแกนหลายรอบ/วัน เช่น
+    //    เข้า 16:00 + ออก 16:00)
+    const uniqueEmployees = [];
+    const seenEmployeeKeys = new Set();
+    for (const e of allEmployees) {
+        const key = `${e.cardId}|${this.toHHMM(e.scanTime)}`;
+        if (!seenEmployeeKeys.has(key)) {
+            seenEmployeeKeys.add(key);
+            uniqueEmployees.push(e);
+        }
+    }
+
+    console.log(`   📊 รวมทั้งหมด (ไม่ซ้ำ): พนักงาน ${uniqueEmployees.length} คน, คนขับ ${uniqueDrivers.length} คน`);
+
+    await this.getOrCreateOperationDay(date);
+
+    // ✅ ============================================================
+    // ✅ IMPORTANT: ให้สร้าง VehicleTrips ทันที只要有พนักงาน (ไม่ต้องรอคนขับ)
+    // ⚠️ แก้บั๊ก: เดิมครอบทั้งบล็อกด้วย if (uniqueEmployees.length > 0)
+    //    เท่านั้น แปลว่าวันที่มีแต่ไฟล์คนขับ (ไม่มีไฟล์พนักงานเลย) จะไม่มี
+    //    การสร้างเที่ยวรถอะไรทั้งสิ้น — ทั้งที่รอบ 17:00 (flatByVehicle)
+    //    และ 20:00 (perTrip) ควรคิดเงินจาก "รถ/คนขับสแกน" ล้วนๆ ไม่ต้อง
+    //    พึ่งข้อมูลพนักงานเลย ตอนนี้เปลี่ยนเงื่อนไขเป็นประมวลผลได้ตราบใดที่
+    //    มีพนักงาน "หรือ" คนขับอย่างใดอย่างหนึ่ง
+    // ✅ ============================================================
+    if (uniqueEmployees.length > 0 || uniqueDrivers.length > 0) {
+        const shifts = this.classifyByShift(uniqueEmployees, uniqueDrivers);
+
+        for (const [shiftCode, shiftData] of Object.entries(shifts)) {
+            // ✅ ถ้าไม่มีคนขับในรอบนี้ แต่มีพนักงาน → ใช้คนขับจากรอบอื่น
+            //    (ใช้เฉพาะรอบที่คิดเงินแบบ perHead ซึ่งต้องพึ่งเบอร์รถของ
+            //    พนักงาน; รอบ perTrip/flatByVehicle ไม่ยุ่งกับ branch นี้
+            //    เพราะต้องอิงคนขับที่สแกนจริงในช่วงเวลาของรอบนั้นเท่านั้น)
+            if (shiftData.employees.length > 0 && shiftData.drivers.length === 0 && uniqueDrivers.length > 0) {
+                shiftData.drivers = uniqueDrivers;
+                console.log(`   🔄 ใช้คนขับ ${uniqueDrivers.length} คน สำหรับรอบ ${shiftCode}`);
+            }
+            await this.processShift(date, shiftCode, shiftData);
+        }
+        await this.updateDaySummary(date);
+
+        // ✅ ตรวจของจริงจาก DB ก่อน log ว่าสำเร็จ (ของเดิม print แบบไม่มีเงื่อนไข
+        //    ทำให้ดูเหมือนสำเร็จทั้งที่ queries.length === 0 แล้วไม่มีอะไรถูก insert จริง)
+        const tripCheck = await executeQuery(`
+            SELECT COUNT(*) as cnt FROM PayrollVehicleTrips 
+            WHERE operationDate = @date AND status != 'deleted'
+        `, { date });
+        const tripsCount = tripCheck.recordset[0]?.cnt || 0;
+
+        if (tripsCount > 0) {
+            console.log(`   ✅ สร้าง VehicleTrips สำหรับพนักงาน ${uniqueEmployees.length} คน / คนขับ ${uniqueDrivers.length} คน เรียบร้อย! (${tripsCount} เที่ยว)`);
+        } else {
+            console.warn(`   ⚠️ ประมวลผลจบแล้ว แต่ไม่มี VehicleTrips ถูกสร้างเลย (พนักงาน ${uniqueEmployees.length} คน น่าจะตกไปอยู่ใน PayrollUnassignedRiders ทั้งหมด เพราะไม่มีคนขับจับคู่ในรอบที่ตรงกัน — ตรวจดูตาราง PayrollUnassignedRiders ของวันที่ ${date})`);
+        }
+    }
+
+    // ✅ อัปเดต processedStatus
+    for (const row of pendingRows) {
+        await executeQuery(`
+            UPDATE PayrollScanRows SET processedStatus = 'matched'
+            WHERE id = @id
+        `, { id: row.id });
+    }
+
+    return {
+        matched: newEmployees.length + newDrivers.length,
+        unmatched: unmatched.length,
+        warnings: []
+    };
+}
+    // ─── CLASSIFY ROWS ───
+    static async classifyRows(rows, employeeMap, driverMap) {
+        const employees = [];
+        const drivers = [];
+        const unmatched = [];
+
+        for (const row of rows) {
+            const cardId = row.cardId ? row.cardId.trim() : '';
+            const fullName = [row.firstName, row.lastName].filter(Boolean).join(' ').trim();
+
+            // ✅ ตรวจสอบคนขับ: ใช้ cardId
+            let driverData = null;
+            if (cardId && driverMap[cardId]) {
+                driverData = driverMap[cardId];
+            }
+
+            if (driverData) {
+                drivers.push({
+                    ...row,
+                    driver: driverData,
+                    vehicleId: driverData.vehicleId,
+                    vehicleDisplayNumber: driverData.displayNumber,
+                    plate: driverData.plate,
+                    personType: 'driver'
+                });
+                await executeQuery(`
+                    UPDATE PayrollScanRows SET 
+                        personType = 'driver',
+                        matchedDriverId = @driverId,
+                        processedStatus = 'matched'
+                    WHERE id = @rowId
+                `, { driverId: driverData.employeeId, rowId: row.id });
+                // ✅ แถวนี้เพิ่งเจอตัวตน (อาจเคยเป็น 'unmatched' มาก่อน) — ปิดรายการ
+                //    ที่ค้างอยู่ในแท็บ Unmatched ของ cardId เดียวกันไปด้วยเลย ไม่ต้อง
+                //    รอให้แอดมินไปกด "สร้างพนักงาน" ในแท็บ Unmatched อีกที
+                if (cardId) await this.closeUnmatchedByCardId(cardId, driverData.employeeId);
+                continue;
+            }
+
+            // ✅ ตรวจสอบพนักงานทั่วไป
+            if (cardId && employeeMap[cardId]) {
+                const employee = employeeMap[cardId];
+                employees.push({
+                    ...row,
+                    employee: employee,
+                    personType: 'employee'
+                });
+                await executeQuery(`
+                    UPDATE PayrollScanRows SET 
+                        personType = 'employee',
+                        matchedEmployeeId = @empId,
+                        processedStatus = 'matched'
+                    WHERE id = @rowId
+                `, { empId: employee.id, rowId: row.id });
+                // ✅ เช่นเดียวกับฝั่งคนขับด้านบน — ปิด Unmatched ของ cardId นี้ทันที
+                if (cardId) await this.closeUnmatchedByCardId(cardId, employee.id);
+                continue;
+            }
+
+            // ❌ ไม่รู้จัก
+            unmatched.push(row);
+            await executeQuery(`
+                UPDATE PayrollScanRows SET 
+                    personType = 'unmatched',
+                    processedStatus = 'unmatched'
+                WHERE id = @rowId
+            `, { rowId: row.id });
+        }
+
+        return { employees, drivers, unmatched };
+    }
+
+   // ─── CLASSIFY BY SHIFT ───
+static classifyByShift(employees, drivers) {
+    const shifts = {};
+
+    for (const emp of employees) {
+        // ✅ ใช้ scanTime อย่างเดียว
+        let shiftCode = this.getShiftByTime(emp.scanTime);
+        if (shiftCode === 'UNKNOWN') {
+            shiftCode = 'D';
+        }
+        
+        if (!shifts[shiftCode]) {
+            shifts[shiftCode] = { shiftCode, employees: [], drivers: [] };
+        }
+        shifts[shiftCode].employees.push(emp);
+    }
+
+    for (const driver of drivers) {
+        let shiftCode = this.getShiftByTime(driver.scanTime);
+        if (shiftCode === 'UNKNOWN') {
+            shiftCode = 'D';
+        }
+        
+        if (!shifts[shiftCode]) {
+            shifts[shiftCode] = { shiftCode, employees: [], drivers: [] };
+        }
+        shifts[shiftCode].drivers.push(driver);
+    }
+
+    return shifts;
+}
+
+    // ─── GET SHIFT FROM EXCEL ───
+    static getShiftFromExcel(shiftRaw) {
+        if (!shiftRaw) return null;
+        
+        const s = String(shiftRaw).trim().toUpperCase();
+        
+        const shiftMap = {
+            'D': 'D',
+            'D1': 'D',
+            'D1S': 'D',
+            'D2': 'EVENING_17',
+            'D3': 'NIGHT_20',
+            'D6': 'NIGHT_20',
+            'N': 'N',
+            'N1': 'N',
+            'N2': 'NIGHT_20',
+            'S': 'EVENING_17',
+            'S1': 'EVENING_17',
+            'S2': 'NIGHT_20',
+            'เข้าเช้า': 'D',
+            'ออกกะ': 'N',
+            'เข้า 16:00': 'EVENING_IN_16',
+            'ออก 16:00': 'EVENING_OUT_16',
+            '17:00': 'EVENING_17',
+            '20:00': 'NIGHT_20',
+            'รอบ 17': 'EVENING_17',
+            'รอบ 20': 'NIGHT_20',
+        };
+        
+        if (/^\d+$/.test(s)) {
+            return shiftMap[`D${s}`] || null;
+        }
+        
+        for (const [key, value] of Object.entries(shiftMap)) {
+            if (s.includes(key) || key.includes(s)) {
+                return value;
+            }
+        }
+        
+        return null;
+    }
+
+    // ─── GET SHIFT BY TIME ───
+    static getShiftByTime(time) {
+        const t = this.toHHMM(time);
+        if (!t) return 'UNKNOWN';
+        
+        if (t >= '06:00' && t <= '07:59') return 'D';
+        if (t >= '08:00' && t <= '09:00') return 'N';
+        if (t >= '15:00' && t <= '15:59') return 'EVENING_IN_16';
+        if (t >= '16:00' && t <= '16:30') return 'EVENING_OUT_16';
+        if (t >= '16:30' && t <= '17:30') return 'EVENING_17';
+        if (t >= '19:00' && t <= '20:59') return 'NIGHT_20';
+        
+        return 'UNKNOWN';
+    }
+
+    // ─── PROCESS SHIFT ───
+    static async processShift(date, shiftCode, shiftData) {
+        if (shiftCode === 'UNKNOWN') {
+            console.warn(`⚠️ ข้ามรอบ UNKNOWN สำหรับวันที่ ${date}`);
+            return;
+        }
+        
+        const shiftType = await executeQuery(`
+            SELECT * FROM PayrollShiftTypes WHERE shiftCode = @shiftCode
+        `, { shiftCode });
+
+        if (shiftType.recordset.length === 0) {
+            console.warn(`⚠️ ไม่พบ ShiftType: ${shiftCode}`);
+            return;
+        }
+
+        const shift = shiftType.recordset[0];
+        const { employees, drivers } = shiftData;
+
+        console.log(`   🕐 รอบ ${shiftCode}: พนักงาน ${employees.length} คน, คนขับ ${drivers.length} คน`);
+
+        const activeDrivers = drivers.filter(d => 
+            this.isInTimeRange(d.scanTime, shift.startTime, shift.endTime)
+        );
+
+        if (activeDrivers.length === 0 && employees.length > 0) {
+            console.warn(`⚠️ ไม่มีคนขับในรอบ ${shiftCode}`);
+        }
+
+        switch (shift.fareType) {
+            case 'perHead':
+                await this.processPerHeadShift(date, shift, employees, activeDrivers);
+                break;
+            case 'flatByVehicle':
+                await this.processFlatByVehicleShift(date, shift, employees, activeDrivers);
+                break;
+            case 'perTrip':
+                // ⚠️ แก้บั๊ก: เดิมถ้ามีพนักงานแต่ไม่มีคนขับ active ในรอบนี้
+                //    จะสลับไปคิดเงินแบบ processPerHeadShift ซึ่งดึง
+                //    employee.fare มาคิดแทน — รอบ 20:00 ต้องคิดเงินจาก
+                //    รถ/คนขับที่สแกนล้วนๆ (PayrollVehicleRates ตาม
+                //    vehicleId + tripCount) ไม่เกี่ยวกับพนักงานเลย ถ้าไม่มี
+                //    คนขับสแกนในรอบนี้ ก็ไม่ต้องสร้างเที่ยว/ไม่คิดเงิน แค่นั้น
+                await this.processNight20Shift(date, shift, drivers);
+                break;
+            default:
+                console.warn(`⚠️ ไม่รู้จัก fareType: ${shift.fareType}`);
+        }
+    }
+
+    // ─── เช็คว่ามีเที่ยวรถของ (วันที่, รอบ, รถ) นี้อยู่แล้วหรือยัง ───
+    //    ⚠️ แก้บั๊ก: ตอน force reprocess จะลบเฉพาะเที่ยวที่ createdBy='system'
+    //    เพื่อไม่ให้ไปทับการแก้ไขที่แอดมินทำเองใน UI (createdBy อื่น) — แต่ INSERT
+    //    เดิมไม่เคยเช็คก่อนว่ามีแถวซ้ำอยู่ไหม พอ reprocess เจอวันที่มีการแก้มือไว้
+    //    ก็จะพยายาม INSERT ซ้ำคีย์ (operationDate, shiftTypeId, vehicleId) เดิม
+    //    ชน unique index UX_VehicleTrips_NoDupe แล้ว throw error หยุดการประมวลผล
+    //    ของ import ทั้งไฟล์ทันที (วันที่ถัดไปในไฟล์เดียวกันไม่ถูกประมวลผลต่อเลย)
+    //    ตอนนี้เช็คก่อน INSERT ทุกจุด ถ้ามีแถวอยู่แล้ว (ไม่ว่าใครสร้าง) ให้ข้าม
+    //    เที่ยวนั้นไปเงียบๆ แทนการ throw — ป้องกันการแก้มือไม่ให้ถูกประมวลผลทับ
+    //    และไม่ทำให้ทั้ง import ล้มเพราะรถคันเดียว
+    static async tripExists(date, shiftTypeId, vehicleId) {
+        const result = await executeQuery(`
+            SELECT TOP 1 id FROM PayrollVehicleTrips
+            WHERE operationDate = @date AND shiftTypeId = @shiftTypeId
+              AND vehicleId = @vehicleId AND status != 'deleted'
+        `, { date, shiftTypeId, vehicleId });
+        return result.recordset.length > 0;
+    }
+
+ // ─── PROCESS PER HEAD SHIFT ───
+static async processPerHeadShift(date, shift, employees, activeDrivers) {
+    const vehiclesResult = await executeQuery(`
+        SELECT id, vehicleNumber, displayNumber
+        FROM Vehicles
+        WHERE status = 'active'
+    `);
+    const vehiclesByNumber = new Map();
+    for (const vehicle of vehiclesResult.recordset) {
+        // id เทียบแบบตัวเลขล้วนตรงๆ (ไม่ใช่ "เบอร์แสดงผล" จึงไม่ normalize)
+        const idKey = String(vehicle.id || '').trim();
+        if (idKey) vehiclesByNumber.set(idKey, vehicle.id);
+        for (const value of [vehicle.vehicleNumber, vehicle.displayNumber]) {
+            const key = normalizeVehicleKey(value);
+            if (key) vehiclesByNumber.set(key, vehicle.id);
+        }
+    }
+
+    // ✅ สร้าง Map คนขับตามรถ
+    // ⚠️ แก้บั๊ก: เดิมเรียก findVehicleByDriver(cardId) ซึ่ง join ด้วยชื่อ
+    //    (Vehicles.driver = Employees.name) แยกจากวิธีที่ driverMap ใช้
+    //    (Employees.defaultVehicleId) — ถ้าชื่อใน Vehicles กับ Employees
+    //    ไม่ตรงกันเป๊ะ (เว้นวรรค/คำนำหน้า/ชื่อเล่น) คนขับจะหลุดไปเงียบๆ
+    //    ตอนนี้ใช้ d.vehicleId ที่แนบมากับ driver object อยู่แล้วแทน
+    //    (มาจาก defaultVehicleId เหมือน driverMap เป๊ะๆ ไม่ต้อง query ซ้ำ)
+    const driverByVehicle = {};
+    for (const d of activeDrivers) {
+        if (d.vehicleId) {
+            driverByVehicle[d.vehicleId] = d;
+        } else {
+            console.warn(`⚠️ คนขับ ${d.cardId} ไม่มี defaultVehicleId ในระบบจัดการพนักงาน`);
+        }
+    }
+
+    const vehicleGroups = {};
+    const unassigned = [];
+
+    // ✅ กันคนที่ถูกจัดเข้ารถของรอบ/วันนี้ไปแล้วจริงๆ (มีแถวใน PayrollTripEmployees
+    //    อยู่แล้ว) ไม่ให้ถูกประเมินใหม่แล้วเหวี่ยงไปกอง "ยังไม่ถูกจัดขึ้นรถ" ซ้ำ
+    //    เวลาฟังก์ชันนี้ถูกเรียกซ้ำ (เช่น import ไฟล์เดิมซ้ำ) — เหมือนกับที่
+    //    assignRidersToTrips() กันไว้ด้วย alreadyAssignedCardIds อยู่แล้ว แต่ฝั่ง
+    //    perHead นี้ไม่เคยมีการเช็คนี้มาก่อนเลย
+    const alreadySeatedRes = await executeQuery(`
+        SELECT te.cardId FROM PayrollTripEmployees te
+        INNER JOIN PayrollVehicleTrips vt ON te.vehicleTripId = vt.id
+        WHERE vt.operationDate = @date AND vt.shiftTypeId = @shiftTypeId
+          AND te.isDriver = 0 AND vt.status != 'deleted'
+    `, { date, shiftTypeId: shift.id });
+    const alreadySeatedCardIds = new Set(
+        alreadySeatedRes.recordset.map(r => (r.cardId || '').trim()).filter(Boolean)
+    );
+
+    for (const emp of employees) {
+        const empCardId = (emp.cardId || '').trim();
+        if (empCardId && alreadySeatedCardIds.has(empCardId)) continue;
+
+        const configuredVehicle = emp.employee?.defaultVehicleId || emp.employee?.defaultVehicleNumber;
+        const vehicleId = configuredVehicle || vehiclesByNumber.get(normalizeVehicleKey(emp.vehicleRaw));
+        const driver = vehicleId ? driverByVehicle[vehicleId] : null;
+        const fareResult = this.resolveFare(emp.fareRaw, emp.employee?.fare);
+
+        // ⚠️ แก้บั๊ก: เดิมแค่เช็คว่ามีเบอร์รถหรือไม่ (vehicleId) แล้วสร้างเที่ยวรถ
+        //    + รวมค่าหัวทันที ทั้งที่ยังไม่เช็คว่ามีคนขับสแกนเข้ารถคันนั้นใน
+        //    รอบนี้จริงไหม (ตัวแปร driver ถูกคำนวณไว้ข้างบนแต่ไม่เคยถูกใช้
+        //    ตัดสินใจเลย) ผลคือพนักงานถูกจับเข้ารถและคิดค่าหัวไปแล้ว ทั้งที่
+        //    ไม่มีคนขับคันนั้นสแกนเข้าระบบเลยในรอบนี้ — ตอนนี้ถ้าไม่มีคนขับ
+        //    ให้ไปเข้า PayrollUnassignedRiders แทน ไม่สร้างเที่ยว/ไม่คิดเงิน
+        //    จนกว่า user จะเลือกรถ/ยืนยันเอง
+        if (!vehicleId) {
+            unassigned.push({
+                operationDate: date,
+                shiftTypeId: shift.id,
+                employeeId: emp.employee?.id || null,
+                cardId: emp.cardId,
+                nameSnapshot: emp.employee?.name || emp.name || '',
+                expectedVehicleId: vehicleId || null,
+                fare: fareResult.fare || 0,
+                reason: 'no_vehicle'
+            });
+            continue;
+        }
+
+        if (!driver) {
+            unassigned.push({
+                operationDate: date,
+                shiftTypeId: shift.id,
+                employeeId: emp.employee?.id || null,
+                cardId: emp.cardId,
+                nameSnapshot: emp.employee?.name || emp.name || '',
+                expectedVehicleId: vehicleId,
+                fare: fareResult.fare || 0,
+                reason: 'no_driver_scan'
+            });
+            continue;
+        }
+
+        // ✅ เก็บค่ารถที่ resolve แล้วไว้ที่ตัว emp เอง เผื่อใช้ตอน insert PayrollTripEmployees
+        //    (ของเดิมอ่าน emp.resolvedFare แต่ไม่เคยมีใครตั้งค่านี้ เลยได้ 0 เสมอ)
+        emp.resolvedFare = fareResult.fare || 0;
+
+        if (!vehicleGroups[vehicleId]) {
+            vehicleGroups[vehicleId] = { totalFare: 0, riders: [] };
+        }
+        vehicleGroups[vehicleId].totalFare += fareResult.fare || 0;
+        vehicleGroups[vehicleId].riders.push(emp);
+    }
+
+    if (unassigned.length > 0) {
+        await this.saveUnassignedRiders(date, shift.id, unassigned);
+    }
+
+    // ✅ ============================================================
+    // ✅ INSERT ทีละคัน แบบ sequential (เหมือน processFlatByVehicleShift /
+    //    processNight20Shift ที่ทำงานถูกอยู่แล้ว) เพราะ query ของ
+    //    PayrollTripEmployees ต้องใช้ id ของ PayrollVehicleTrips ที่เพิ่ง
+    //    insert เสร็จ — สร้างเป็น query array ไว้ล่วงหน้าแล้วยิงทีเดียว
+    //    ทำแบบนั้นไม่ได้ เพราะตอนสร้าง query ยังไม่รู้ id นั้น
+    // ✅ ============================================================
+    let tripsCreated = 0;
+
+    for (const [vehicleId, group] of Object.entries(vehicleGroups)) {
+        if (group.riders.length === 0) continue;
+
+        if (await this.tripExists(date, shift.id, parseInt(vehicleId))) {
+            console.warn(`   ⏭️ ข้าม vehicleId=${vehicleId} วันที่ ${date} รอบ ${shift.id} — มีเที่ยวรถอยู่แล้ว (สร้าง/แก้โดยแอดมิน) ไม่สร้างซ้ำ`);
+            continue;
+        }
+
+        console.log(`   📝 กำลัง INSERT VehicleTrip: date=${date}, vehicleId=${vehicleId}, totalFare=${group.totalFare}, totalRiders=${group.riders.length}`);
+
+        try {
+            const tripResult = await executeQuery(`
+                INSERT INTO PayrollVehicleTrips (
+                    operationDate, shiftTypeId, vehicleId, driverCardId,
+                    fareType, fareUsed, totalFare, totalRiders, status, createdBy
+                ) OUTPUT INSERTED.id
+                VALUES (
+                    @date, @shiftTypeId, @vehicleId, @driverCardId,
+                    'perHead', 0, @totalFare, @totalRiders, 'draft', 'system'
+                )
+            `, {
+                date,
+                shiftTypeId: shift.id,
+                vehicleId: parseInt(vehicleId),
+                driverCardId: driverByVehicle[vehicleId]?.cardId || null,
+                totalFare: group.totalFare,
+                totalRiders: group.riders.length
+            });
+
+            const tripId = tripResult.recordset[0].id;
+
+            for (const emp of group.riders) {
+                await executeQuery(`
+                    INSERT INTO PayrollTripEmployees (
+                        vehicleTripId, employeeId, cardId, nameSnapshot,
+                        department, section, destination, fare, isDriver
+                    ) VALUES (
+                        @tripId, @empId, @cardId, @name,
+                        @department, @section, @destination, @fare, 0
+                    )
+                `, {
+                    tripId,
+                    empId: emp.employee?.id || null,
+                    cardId: emp.cardId || '',
+                    name: emp.employee?.name || emp.name || '',
+                    department: emp.employee?.department || '',
+                    section: emp.employee?.section || '',
+                    destination: emp.employee?.address || '',
+                    fare: emp.resolvedFare || 0
+                });
+            }
+
+            tripsCreated++;
+        } catch (error) {
+            console.error(`   ❌ INSERT ล้มเหลว สำหรับ vehicleId=${vehicleId}:`, error.message);
+            throw error;
+        }
+    }
+
+    if (tripsCreated === 0) {
+        console.log(`   ⏳ ไม่มี queries ที่ต้องประมวลผล`);
+    } else {
+        console.log(`   ✅ INSERT สำเร็จ! ทั้งหมด ${tripsCreated} เที่ยว`);
+    }
+
+    return { vehicleGroups, unassignedCount: unassigned.length, tripsCreated };
+}
+
+    // ─── PROCESS FLAT BY VEHICLE SHIFT ───
+    static async processFlatByVehicleShift(date, shift, employees, activeDrivers) {
+        // ✅ กันข้อมูลซ้ำตอน force-reprocess: ถ้าพนักงานคนนี้ถูกจัดเข้ารถของ
+        //    วันที่/รอบนี้ไปแล้วจริง (มีแถวใน PayrollTripEmployees อยู่แล้ว ไม่ว่า
+        //    จะรถคันไหน หรือถูกสร้าง/แก้โดยแอดมินเองด้วยมือ ('เพิ่มคนขับ'/'ย้ายรถ')
+        //    ก็ตาม) ต้องไม่จับคนคนนี้เข้ารถซ้ำอีกรอบตอนประมวลผลใหม่ — เดิมฟังก์ชันนี้
+        //    ไม่เคยเช็คจุดนี้เลย (ต่างจาก processPerHeadShift ที่กันไว้แล้วด้วย
+        //    alreadySeatedCardIds) ทำให้รอบ 17:00 (flatByVehicle) เป็นรอบที่เจอ
+        //    บั๊กข้อมูลซ้ำสองที่บ่อยที่สุดตอน reprocess
+        const alreadySeatedRes = await executeQuery(`
+            SELECT te.cardId FROM PayrollTripEmployees te
+            INNER JOIN PayrollVehicleTrips vt ON te.vehicleTripId = vt.id
+            WHERE vt.operationDate = @date AND vt.shiftTypeId = @shiftTypeId
+              AND te.isDriver = 0 AND vt.status != 'deleted'
+        `, { date, shiftTypeId: shift.id });
+        const alreadySeatedCardIds = new Set(
+            alreadySeatedRes.recordset.map(r => (r.cardId || '').trim()).filter(Boolean)
+        );
+        if (alreadySeatedCardIds.size > 0) {
+            employees = employees.filter(emp => {
+                const empCardId = (emp.cardId || '').trim();
+                return !(empCardId && alreadySeatedCardIds.has(empCardId));
+            });
+        }
+
+        // ⚠️ แก้บั๊ก: เดิม `if (activeDrivers.length === 0) return;` ตรงนี้
+        //    ทำให้พนักงานที่สแกน/ถูกจัดเข้ารอบ 17:00 (flatByVehicle) ทั้งหมด
+        //    หายไปเงียบๆ ทันทีถ้าวันนั้นไม่มีคนขับสแกนเข้ารอบนี้เลย — ไม่ถูก
+        //    สร้างเที่ยวรถ และไม่ถูกบันทึกลง PayrollUnassignedRiders ด้วย
+        //    (ต่างจาก processPerHeadShift ที่ทำแบบเดียวกันแล้วพนักงานไปโผล่
+        //    เป็น "รอรถ" ในรอบนั้นแทน) ตอนนี้แก้ให้พฤติกรรมตรงกัน: ถ้าไม่มี
+        //    คนขับเลย ให้พนักงานทั้งหมดของรอบนี้ไปเข้า PayrollUnassignedRiders
+        //    (reason: 'no_driver_scan') แทนการ return เงียบๆ
+        if (activeDrivers.length === 0) {
+            if (employees.length > 0) {
+                const unassigned = employees.map(emp => ({
+                    operationDate: date,
+                    shiftTypeId: shift.id,
+                    employeeId: emp.employee?.id || null,
+                    cardId: emp.cardId,
+                    nameSnapshot: emp.employee?.name || emp.name || emp.firstName || '',
+                    expectedVehicleId: null,
+                    fare: 0,
+                    reason: 'no_driver_scan'
+                }));
+                await this.saveUnassignedRiders(date, shift.id, unassigned);
+                console.warn(`   ⏳ รอบ ${shift.shiftCode} (${date}): ไม่มีคนขับสแกนเข้ารอบนี้เลย — พนักงาน ${employees.length} คน ถูกย้ายไป "รอรถ" (PayrollUnassignedRiders) แทน`);
+            }
+            return;
+        }
+
+        const rateResult = await executeQuery(`
+            SELECT TOP 1 rate FROM PayrollRateSettings 
+            WHERE shiftCode = @shiftCode AND isActive = 1
+            ORDER BY effectiveFrom DESC
+        `, { shiftCode: shift.shiftCode });
+
+        const flatRate = rateResult.recordset[0]?.rate || 300;
+
+        const vehicleGroups = this.distributeEmployeesEvenly(employees, activeDrivers);
+
+        for (const [driverCardId, group] of Object.entries(vehicleGroups)) {
+            const driver = activeDrivers.find(d => d.cardId === driverCardId);
+            if (!driver) continue;
+
+            if (await this.tripExists(date, shift.id, driver.vehicleId)) {
+                console.warn(`   ⏭️ ข้าม vehicleId=${driver.vehicleId} วันที่ ${date} รอบ ${shift.id} — มีเที่ยวรถอยู่แล้ว (สร้าง/แก้โดยแอดมิน) ไม่สร้างซ้ำ`);
+                continue;
+            }
+
+            const tripResult = await executeQuery(`
+                INSERT INTO PayrollVehicleTrips (
+                    operationDate, shiftTypeId, vehicleId, driverCardId,
+                    fareType, fareUsed, totalFare, totalRiders, status, createdBy
+                ) OUTPUT INSERTED.id
+                VALUES (
+                    @date, @shiftTypeId, @vehicleId, @driverCardId,
+                    'flatByVehicle', @fareUsed, @totalFare, @totalRiders, 'draft', 'system'
+                )
+            `, {
+                date,
+                shiftTypeId: shift.id,
+                vehicleId: driver.vehicleId,
+                driverCardId: driver.cardId,
+                fareUsed: flatRate,
+                totalFare: flatRate,
+                totalRiders: group.employees.length
+            });
+
+            const tripId = tripResult.recordset[0].id;
+
+            for (const emp of group.employees) {
+                await executeQuery(`
+                    INSERT INTO PayrollTripEmployees (
+                        vehicleTripId, employeeId, cardId, nameSnapshot,
+                        department, section, destination, fare, fareSource, isDriver
+                    ) VALUES (
+                        @tripId, @empId, @cardId, @name,
+                        @department, @section, @destination, 0, 'flat_rate', 0
+                    )
+                `, {
+                    tripId,
+                    empId: emp.employee?.id || null,
+                    cardId: emp.cardId,
+                    name: emp.employee?.name || emp.firstName || '',
+                    department: emp.employee?.department || '',
+                    section: emp.employee?.section || '',
+                    destination: emp.employee?.address || emp.destinationRaw || ''
+                });
+            }
+        }
+    }
+
+    // ─── PROCESS NIGHT 20 SHIFT ───
+    static async processNight20Shift(date, shift, drivers) {
+        const activeDrivers = drivers.filter(d => 
+            this.isInTimeRange(d.scanTime, '19:00', '20:59')
+        );
+
+        if (activeDrivers.length === 0) {
+            console.log(`⚠️ ไม่มีคนขับในรอบ 20:00`);
+            return;
+        }
+
+        const scansByDriver = {};
+        for (const d of activeDrivers) {
+            const key = d.cardId || d.driverCardId;
+            if (!key) continue;
+            if (!scansByDriver[key]) scansByDriver[key] = [];
+            scansByDriver[key].push(d);
+        }
+
+        for (const [cardId, scans] of Object.entries(scansByDriver)) {
+            // ⚠️ แก้บั๊ก: เดิมเรียก findVehicleByDriver(cardId) ซึ่ง join ด้วยชื่อ
+            //    (Vehicles.driver = Employees.name) ทำให้คนขับที่ชื่อใน Vehicles
+            //    ไม่ตรงกับ Employees เป๊ะๆ หลุดไปเงียบๆ ไม่ถูกสร้าง trip เลย
+            //    ตอนนี้ใช้ vehicleId/displayNumber ที่แนบมากับ scan อยู่แล้ว
+            //    (มาจาก defaultVehicleId เหมือน driverMap ตอน import)
+            const driverInfo = scans[0];
+            const vehicleId = driverInfo.vehicleId;
+            const vehicleDisplayNumber = driverInfo.vehicleDisplayNumber || driverInfo.plate;
+
+            if (!vehicleId) {
+                console.warn(`⚠️ คนขับ ${cardId} ไม่มี defaultVehicleId ในระบบจัดการพนักงาน (ไม่มีรถประจำ)`);
+                continue;
+            }
+
+            const before20 = scans.filter(s => {
+                const t = this.toHHMM(s.scanTime || s.time);
+                return t && t < '20:00';
+            }).length;
+            
+            const after20 = scans.filter(s => {
+                const t = this.toHHMM(s.scanTime || s.time);
+                return t && t >= '20:00';
+            }).length;
+            
+            const tripCount = Math.min(before20, 1) + Math.min(after20, 1);
+
+            if (tripCount === 0) continue;
+
+            // ✅ ป้ายชื่อรอบ 20:00 คำนวณแบบไดนามิก เพราะแถวเดียวกันอาจเป็น
+            //    "รับพนักงานเข้า" อย่างเดียว, "รับพนักงานกลับ" อย่างเดียว,
+            //    หรือทั้งสองอย่าง (2 เที่ยว) แล้วแต่ว่าคนขับสแกนช่วงไหนบ้าง
+            let tripLabel;
+            if (before20 > 0 && after20 > 0) {
+                tripLabel = 'รับพนักงาน เข้า 20:00 + รับพนักงานกลับ ออก 20:00 (2 เที่ยว)';
+            } else if (before20 > 0) {
+                tripLabel = 'รับพนักงาน เข้า 20:00';
+            } else {
+                tripLabel = 'รับพนักงานกลับ ออก 20:00';
+            }
+
+            const rate = await this.getVehicleNightRate(vehicleId, tripCount);
+            if (rate === null) {
+                console.warn(`⚠️ ไม่พบราคารอบ 20:00 สำหรับรถ ${vehicleDisplayNumber || vehicleId} (${tripCount} เที่ยว)`);
+                continue;
+            }
+
+            if (await this.tripExists(date, shift.id, vehicleId)) {
+                console.warn(`   ⏭️ ข้าม vehicleId=${vehicleId} วันที่ ${date} รอบ ${shift.id} — มีเที่ยวรถอยู่แล้ว (สร้าง/แก้โดยแอดมิน) ไม่สร้างซ้ำ`);
+                continue;
+            }
+
+            await executeQuery(`
+                INSERT INTO PayrollVehicleTrips (
+                    operationDate, shiftTypeId, vehicleId, driverCardId,
+                    fareType, fareUsed, totalFare, totalRiders, tripSeq, note, status, createdBy
+                ) VALUES (
+                    @date, @shiftTypeId, @vehicleId, @driverCardId,
+                    'perTrip', @fareUsed, @totalFare, 1, @tripSeq, @note, 'draft', 'system'
+                )
+            `, {
+                date,
+                shiftTypeId: shift.id,
+                vehicleId: vehicleId,
+                driverCardId: cardId,
+                fareUsed: rate,
+                totalFare: rate,
+                tripSeq: tripCount,
+                note: tripLabel
+            });
+
+            console.log(`✅ บันทึกเที่ยว 20:00: รถ ${vehicleDisplayNumber || vehicleId} — ${tripLabel} (${tripCount} เที่ยว) = ${rate} บาท`);
+        }
+    }
+
+    // ─── FIND VEHICLE BY DRIVER CARD ID ───
+    static async findVehicleByDriver(cardId) {
+        const result = await executeQuery(`
+            SELECT v.* FROM Vehicles v
+            INNER JOIN Employees e ON v.driver = e.name OR v.backupDriver = e.name
+            WHERE e.cardId = @cardId AND v.status = 'active'
+        `, { cardId });
+        return result.recordset[0] || null;
+    }
+
+    // ─── GET VEHICLE NIGHT RATE ───
+    static async getVehicleNightRate(vehicleId, tripCount) {
+        const result = await executeQuery(`
+            SELECT TOP 1 rate FROM PayrollVehicleRates
+            WHERE vehicleId = @vehicleId AND shiftCode = 'NIGHT_20'
+            AND tripCount = @tripCount AND isActive = 1
+            ORDER BY effectiveDate DESC
+        `, { vehicleId, tripCount });
+
+        return result.recordset[0]?.rate || null;
+    }
+
+  // ─── SAVE UNASSIGNED RIDERS ───
+static async saveUnassignedRiders(date, shiftTypeId, unassignedList) {
+    if (!unassignedList || unassignedList.length === 0) return;
+
+    // ✅ ลบของเก่าก่อน (กันซ้ำ)
+    await executeQuery(`
+        DELETE FROM PayrollUnassignedRiders 
+        WHERE operationDate = @date AND shiftTypeId = @shiftTypeId
+    `, { date, shiftTypeId });
+
+    for (const u of unassignedList) {
+        // ✅ ถ้า employeeId เป็น NULL ให้ข้าม
+        if (!u.employeeId) {
+            console.warn(`⚠️ ข้าม Unassigned: ${u.nameSnapshot} (ไม่มี employeeId)`);
+            continue;
+        }
+
+        await executeQuery(`
+            INSERT INTO PayrollUnassignedRiders (
+                operationDate, shiftTypeId, employeeId, cardId, nameSnapshot,
+                expectedVehicleId, fare, reason, status
+            ) VALUES (
+                @operationDate, @shiftTypeId, @employeeId, @cardId, @nameSnapshot,
+                @expectedVehicleId, @fare, @reason, 'pending'
+            )
+        `, {
+            operationDate: u.operationDate,
+            shiftTypeId: u.shiftTypeId,
+            employeeId: u.employeeId,
+            cardId: u.cardId || '',
+            nameSnapshot: u.nameSnapshot || '',
+            expectedVehicleId: u.expectedVehicleId || null,
+            fare: u.fare || 0,
+            reason: u.reason || 'no_driver_scan'
+        });
+    }
+}
+
+    // ─── จัดคนลงรถอัตโนมัติ (กดเองจากปุ่มในหน้าเว็บ) ───
+    //    ใช้ได้เฉพาะรอบ flatByVehicle (17:00) และ perTrip (20:00) เท่านั้น
+    //    ห้ามใช้กับรอบ perHead เด็ดขาด เพราะรอบนั้นคิดเงินตามจำนวนคนจริง
+    //    ที่พนักงานกรอก/สแกนเข้ารถของตัวเองอยู่แล้ว ไม่ต้องเฉลี่ย
+    //
+    //    หลักการ: เอาเฉพาะรถที่ถูก "เพิ่มรถเข้ารอบ" ไว้แล้วในระบบ (เรียง
+    //    ตามลำดับที่เพิ่มก่อน = vt.id น้อยไปมาก) แล้วดึงพนักงานที่สแกนหน้า
+    //    ในช่วงเวลาของรอบนี้ มาเฉลี่ยลงแบบ round-robin ทีละคนตามลำดับรถ
+    //    ไม่ให้เกินที่นั่ง (Vehicles.maxPassengers) ของแต่ละคัน ถ้าคนเกิน
+    //    ที่นั่งที่มี จะถูกบันทึกลง PayrollUnassignedRiders (reason:
+    //    'vehicle_full') ให้แอดมินไปจัดการต่อ — ไม่มีการสร้างเที่ยวรถใหม่
+    //    ในฟังก์ชันนี้ (ต้องกด "เพิ่มรอบ" ให้ครบก่อนแล้วค่อยกดจัดคน)
+    //
+    //    รอบ 20:00 (NIGHT_20): แยกทำ fareSource เป็น 'night_in'/'night_out'
+    //    ตามเวลาสแกน (ก่อน/หลัง 20:00) เพื่อให้รายงานแยกแสดงเข้างาน/ออกงาน
+    //    ได้ แต่ยังนับรวมเป็นเที่ยวเดียวกัน (ไม่แยกเที่ยวรถ)
+    static async assignRidersToTrips(operationDate, shiftTypeId, userId = 'admin') {
+        const shiftRes = await executeQuery(`
+            SELECT * FROM PayrollShiftTypes WHERE id = @shiftTypeId
+        `, { shiftTypeId });
+        const shift = shiftRes.recordset[0];
+        if (!shift) throw new Error('ไม่พบรอบเวลานี้');
+
+        if (shift.fareType === 'perHead') {
+            throw new Error('รอบนี้เป็นรอบคิดค่าหัว (perHead) — ห้ามใช้ระบบจัดคนลงรถอัตโนมัติ ใช้ได้เฉพาะรอบเหมาคัน/เหมาเที่ยวเท่านั้น');
+        }
+
+        // ✅ รถที่ถูกเพิ่มเข้ารอบนี้แล้ว เรียงตามลำดับที่เพิ่มก่อน (id น้อยไปมาก)
+        const tripsRes = await executeQuery(`
+            SELECT vt.id, vt.vehicleId, v.displayNumber, v.maxPassengers
+            FROM PayrollVehicleTrips vt
+            INNER JOIN Vehicles v ON vt.vehicleId = v.id
+            WHERE vt.operationDate = @operationDate AND vt.shiftTypeId = @shiftTypeId AND vt.status != 'deleted'
+            ORDER BY vt.id ASC
+        `, { operationDate, shiftTypeId });
+        const trips = tripsRes.recordset;
+
+        const warnings = [];
+        for (const t of trips) {
+            const cntRes = await executeQuery(`
+                SELECT COUNT(*) as cnt FROM PayrollTripEmployees WHERE vehicleTripId = @tripId AND isDriver = 0
+            `, { tripId: t.id });
+            t.filled = cntRes.recordset[0]?.cnt || 0;
+            const cap = t.maxPassengers || 0;
+            t.remaining = Math.max(cap - t.filled, 0);
+            if (!cap) {
+                warnings.push(`รถเบอร์ ${t.displayNumber || t.vehicleId} ยังไม่ได้ตั้งค่าที่นั่งสูงสุด (maxPassengers) ในหน้าจัดการรถ — จะไม่ถูกจัดคนให้`);
+            }
+        }
+
+        // ✅ คนที่ถูกจัดลงรถของรอบนี้ วันนี้ไปแล้ว (กันใส่ซ้ำเวลากดปุ่มซ้ำ)
+        const assignedRes = await executeQuery(`
+            SELECT te.cardId FROM PayrollTripEmployees te
+            INNER JOIN PayrollVehicleTrips vt ON te.vehicleTripId = vt.id
+            WHERE vt.operationDate = @operationDate AND vt.shiftTypeId = @shiftTypeId AND te.isDriver = 0
+        `, { operationDate, shiftTypeId });
+        const alreadyAssignedCardIds = new Set(assignedRes.recordset.map(r => (r.cardId || '').trim()));
+
+        // ✅ พนักงานที่สแกนหน้าในวันนี้ (กรองช่วงเวลาของรอบด้วย JS ไม่ใช่ SQL
+        //    เพราะ scanTime/startTime-endTime เป็นคนละ data type กัน ทำให้
+        //    SQL Server ขึ้น error "time and datetime are incompatible" ถ้า
+        //    เทียบตรงๆ ใน WHERE — จุดอื่นในระบบ (isInTimeRange) ก็หลีกเลี่ยง
+        //    การเทียบเวลาฝั่ง SQL ด้วยเหตุผลเดียวกัน)
+        const scansRes = await executeQuery(`
+            SELECT sr.cardId, sr.firstName, sr.lastName, sr.scanTime, sr.matchedEmployeeId,
+                   e.name, e.department, e.section, e.address
+            FROM PayrollScanRows sr
+            INNER JOIN Employees e ON sr.matchedEmployeeId = e.id
+            WHERE sr.scanDate = @operationDate
+              AND sr.personType = 'employee'
+        `, { operationDate });
+
+        const seen = new Set();
+        const scannedEmployees = [];
+        for (const row of scansRes.recordset
+            .filter(r => this.isInTimeRange(r.scanTime, shift.startTime, shift.endTime))
+            .sort((a, b) => this.toHHMM(a.scanTime).localeCompare(this.toHHMM(b.scanTime)))) {
+            const cardId = (row.cardId || '').trim();
+            if (!cardId || seen.has(cardId) || alreadyAssignedCardIds.has(cardId)) continue;
+            seen.add(cardId);
+            scannedEmployees.push(row);
+        }
+
+        if (scannedEmployees.length === 0) {
+            return { assigned: 0, unassigned: 0, vehicles: trips.length, warnings, message: 'ไม่พบพนักงานสแกนหน้าในช่วงเวลาของรอบนี้ (หรือถูกจัดรถไปหมดแล้ว)' };
+        }
+
+        // ✅ ยังไม่มีรถถูกเพิ่มเข้ารอบนี้เลย — แทนที่จะทิ้งไปเงียบๆ ให้บันทึกทุกคน
+        //    ลง PayrollUnassignedRiders (reason: 'no_vehicle_trip') เพื่อให้ขึ้น
+        //    โชว์ในหน้า "รอจัดรถ" ของรอบนี้ พอแอดมินกด "เพิ่มรอบ" ใส่รถแล้ว
+        //    ค่อยกดปุ่มจัดคนอัตโนมัติซ้ำอีกครั้ง
+        if (trips.length === 0) {
+            await executeQuery(`
+                DELETE FROM PayrollUnassignedRiders
+                WHERE operationDate = @operationDate AND shiftTypeId = @shiftTypeId
+                  AND reason = 'no_vehicle_trip' AND status = 'pending'
+            `, { operationDate, shiftTypeId });
+
+            for (const emp of scannedEmployees) {
+                await executeQuery(`
+                    INSERT INTO PayrollUnassignedRiders (
+                        operationDate, shiftTypeId, employeeId, cardId, nameSnapshot,
+                        expectedVehicleId, fare, reason, status
+                    ) VALUES (
+                        @operationDate, @shiftTypeId, @employeeId, @cardId, @nameSnapshot,
+                        NULL, 0, 'no_vehicle_trip', 'pending'
+                    )
+                `, {
+                    operationDate, shiftTypeId,
+                    employeeId: emp.matchedEmployeeId,
+                    cardId: emp.cardId,
+                    nameSnapshot: emp.name || `${emp.firstName || ''} ${emp.lastName || ''}`.trim()
+                });
+            }
+
+            return {
+                assigned: 0,
+                unassigned: scannedEmployees.length,
+                vehicles: 0,
+                warnings,
+                message: `ยังไม่มีรถถูกเพิ่มเข้ารอบนี้ — พักพนักงาน ${scannedEmployees.length} คนไว้ในรายการ "รอจัดรถ" ให้แล้ว กรุณา "เพิ่มรอบ" แล้วจัดคนอีกครั้ง`
+            };
+        }
+
+        // ✅ Round-robin ทีละคน ตามลำดับรถที่เพิ่มก่อน ไม่เกินที่นั่งที่เหลือ
+        let assigned = 0;
+        const unassignedPeople = [];
+        let idx = 0;
+        for (const emp of scannedEmployees) {
+            let placed = false;
+            for (let i = 0; i < trips.length; i++) {
+                const t = trips[(idx + i) % trips.length];
+                if (t.remaining > 0) {
+                    const empScanHHMM = this.toHHMM(emp.scanTime);
+                    const fareSource = shift.shiftCode === 'NIGHT_20'
+                        ? (empScanHHMM && empScanHHMM < '20:00' ? 'night_in' : 'night_out')
+                        : 'flat_rate';
+
+                    await executeQuery(`
+                        INSERT INTO PayrollTripEmployees (
+                            vehicleTripId, employeeId, cardId, nameSnapshot,
+                            department, section, destination, fare, fareSource, isDriver
+                        ) VALUES (
+                            @tripId, @empId, @cardId, @name,
+                            @department, @section, @destination, 0, @fareSource, 0
+                        )
+                    `, {
+                        tripId: t.id,
+                        empId: emp.matchedEmployeeId,
+                        cardId: emp.cardId,
+                        name: emp.name || `${emp.firstName || ''} ${emp.lastName || ''}`.trim(),
+                        department: emp.department || '',
+                        section: emp.section || '',
+                        destination: emp.address || '',
+                        fareSource
+                    });
+
+                    t.remaining--;
+                    t.filled++;
+                    assigned++;
+                    idx = (idx + i + 1) % trips.length;
+                    placed = true;
+
+                    // ✅ เคลียร์ record ค้างใน PayrollUnassignedRiders ของคนคนนี้
+                    //    ในรอบ/วันนี้ (ไม่ว่า reason จะเป็น no_vehicle_trip,
+                    //    no_driver_scan, vehicle_full เดิม ฯลฯ) เพราะตอนนี้เขา
+                    //    ถูกจัดเข้ารถจริงแล้ว ไม่งั้น banner "ยังไม่ถูกจัดขึ้นรถ"
+                    //    จะค้างโชว์คนที่จัดรถไปแล้วอยู่ดี
+                    await executeQuery(`
+                        UPDATE PayrollUnassignedRiders SET status = 'resolved', updatedAt = GETDATE()
+                        WHERE operationDate = @operationDate AND shiftTypeId = @shiftTypeId
+                          AND cardId = @cardId AND status = 'pending'
+                    `, { operationDate, shiftTypeId, cardId: emp.cardId });
+
+                    break;
+                }
+            }
+            if (!placed) unassignedPeople.push(emp);
+        }
+
+        // ✅ อัปเดต totalRiders ของแต่ละเที่ยวให้ตรงกับจำนวนคนจริง
+        for (const t of trips) {
+            await executeQuery(`
+                UPDATE PayrollVehicleTrips SET totalRiders = @riders WHERE id = @id
+            `, { riders: t.filled, id: t.id });
+        }
+
+        // ✅ ล้างรายการ "คนไม่มีรถ (รถเต็ม)" เก่าของรอบนี้ วันนี้ทิ้งก่อน
+        //    แล้วค่อยบันทึกรายการล่าสุด กันสะสมซ้ำเวลากดปุ่มหลายครั้ง
+        await executeQuery(`
+            DELETE FROM PayrollUnassignedRiders
+            WHERE operationDate = @operationDate AND shiftTypeId = @shiftTypeId
+              AND reason = 'vehicle_full' AND status = 'pending'
+        `, { operationDate, shiftTypeId });
+
+        for (const emp of unassignedPeople) {
+            await executeQuery(`
+                INSERT INTO PayrollUnassignedRiders (
+                    operationDate, shiftTypeId, employeeId, cardId, nameSnapshot,
+                    expectedVehicleId, fare, reason, status
+                ) VALUES (
+                    @operationDate, @shiftTypeId, @employeeId, @cardId, @nameSnapshot,
+                    NULL, 0, 'vehicle_full', 'pending'
+                )
+            `, {
+                operationDate, shiftTypeId,
+                employeeId: emp.matchedEmployeeId,
+                cardId: emp.cardId,
+                nameSnapshot: emp.name || `${emp.firstName || ''} ${emp.lastName || ''}`.trim()
+            });
+        }
+
+        await this.logAudit('PayrollVehicleTrips', shiftTypeId, 'autoAssignRiders',
+            `assigned=${assigned}, unassigned=${unassignedPeople.length}`, 'UPDATE', userId);
+
+        return {
+            assigned,
+            unassigned: unassignedPeople.length,
+            vehicles: trips.length,
+            warnings,
+            message: `จัดคนลงรถสำเร็จ ${assigned} คน` + (unassignedPeople.length > 0 ? ` — เหลือ ${unassignedPeople.length} คนไม่มีรถ (รถเต็ม)` : '')
+        };
+    }
+
+    // ─── DISTRIBUTE EMPLOYEES EVENLY ───
+    static distributeEmployeesEvenly(employees, drivers) {
+        const result = {};
+        const sortedDrivers = drivers.sort((a, b) => (a.cardId || '').localeCompare(b.cardId || ''));
+
+        for (const driver of sortedDrivers) {
+            result[driver.cardId || driver.driverName] = { driver, employees: [] };
+        }
+
+        const driverKeys = Object.keys(result);
+        employees.forEach((emp, index) => {
+            const key = driverKeys[index % driverKeys.length];
+            result[key].employees.push(emp);
+        });
+
+        return result;
+    }
+
+    // ─── RESOLVE FARE ───
+    // ✅ แก้บั๊ก: เดิมยึดค่ารถจากไฟล์ Excel ที่นำเข้าเป็นหลักเสมอ (ถ้า parse
+    //    เป็นตัวเลขได้) ทำให้ราคาที่ตั้งไว้ใน "จัดการพนักงาน" ถูกข้ามไปเงียบๆ
+    //    ตอนนี้ยึดค่ารถใน "จัดการพนักงาน" (master) เป็นหลักเสมอถ้ามีค่าตั้งไว้
+    //    ค่าจาก Excel ใช้เป็น fallback เฉพาะกรณี master ยังไม่มีค่ารถเท่านั้น
+    static resolveFare(fareRaw, employeeFare) {
+        const excelFare = this.parseFare(fareRaw);
+
+        if (employeeFare !== null && employeeFare !== undefined && employeeFare > 0) {
+            return {
+                fare: employeeFare,
+                source: 'master',
+                needsMasterSync: false,
+                // แจ้งเตือนเฉยๆ ถ้าราคาที่ import มาต่างจาก master (ไม่ได้บังคับใช้)
+                fareMismatch: excelFare !== null && excelFare !== employeeFare,
+                needsAlert: false
+            };
+        }
+
+        if (excelFare !== null) {
+            return {
+                fare: excelFare,
+                source: 'excel',
+                needsMasterSync: true, // เตือนให้ไปตั้งค่ารถของพนักงานคนนี้ใน master ด้วย
+                needsAlert: false
+            };
+        }
+
+        return {
+            fare: null,
+            source: 'none',
+            needsMasterSync: false,
+            needsAlert: true
+        };
+    }
+
+    static parseFare(raw) {
+        if (raw == null) return null;
+        const str = String(raw).trim().toUpperCase();
+        if (str === '' || str === '#N/A' || str === 'N/A' || str === '-' || str === 'NULL') return null;
+        const num = parseFloat(str);
+        return isNaN(num) ? null : num;
+    }
+
+    // ─── HELPERS ───
+    static async getOrCreateOperationDay(date) {
+        const existing = await executeQuery(`
+            SELECT * FROM PayrollOperationDays WHERE operationDate = @date
+        `, { date });
+
+        if (existing.recordset.length > 0) {
+            return existing.recordset[0];
+        }
+
+        const result = await executeQuery(`
+            INSERT INTO PayrollOperationDays (operationDate, status, createdBy)
+            OUTPUT INSERTED.*
+            VALUES (@date, 'draft', 'system')
+        `, { date });
+
+        return result.recordset[0];
+    }
+
+    static async updateDaySummary(date) {
+        const summary = await executeQuery(`
+            SELECT 
+                COUNT(DISTINCT vt.vehicleId) as totalVehicles,
+                SUM(vt.totalRiders) as totalEmployees,
+                SUM(vt.totalFare) as totalFare
+            FROM PayrollVehicleTrips vt
+            WHERE vt.operationDate = @date AND vt.status != 'deleted'
+        `, { date });
+
+        const data = summary.recordset[0] || { totalVehicles: 0, totalEmployees: 0, totalFare: 0 };
+
+        await executeQuery(`
+            UPDATE PayrollOperationDays SET
+                totalVehicles = @totalVehicles,
+                totalEmployees = @totalEmployees,
+                totalFare = @totalFare,
+                updatedAt = GETDATE()
+            WHERE operationDate = @date
+        `, {
+            date,
+            totalVehicles: data.totalVehicles || 0,
+            totalEmployees: data.totalEmployees || 0,
+            totalFare: data.totalFare || 0
+        });
+    }
+
+    // ✅ แปลงค่าเวลาให้เป็น string 'HH:MM' เสมอ ไม่ว่าจะเป็น string หรือ Date object
+    // (SQL Server TIME column ถูก mssql driver แปลงกลับมาเป็น JS Date object โดยอัตโนมัติ
+    //  เช่น 1970-01-01T06:00:00.000Z ไม่ใช่ string "06:00" เหมือนตอนอ่านจาก Excel)
+    static toHHMM(value) {
+        if (value == null) return null;
+        if (value instanceof Date) {
+            // mssql driver คืนค่า TIME เป็น Date แบบ UTC (useUTC default = true)
+            const h = String(value.getUTCHours()).padStart(2, '0');
+            const m = String(value.getUTCMinutes()).padStart(2, '0');
+            return `${h}:${m}`;
+        }
+        return String(value).padStart(5, '0').slice(0, 5);
+    }
+
+    static isInTimeRange(time, start, end) {
+        if (!time) return false;
+        const t = this.toHHMM(time);
+        const s = this.toHHMM(start);
+        const e = this.toHHMM(end);
+        if (t === null || s === null || e === null) return false;
+        return t >= s && t <= e;
+    }
+
+    static findColumn(headers, keywords) {
+        for (const keyword of keywords) {
+            const found = headers.find(h => {
+                const hStr = String(h).trim().toLowerCase();
+                const kStr = String(keyword).toLowerCase();
+                return hStr.includes(kStr) || kStr.includes(hStr);
+            });
+            if (found) return found;
+        }
+        return null;
+    }
+
+    // ─── PARSE DATE ───
+    static parseDate(value) {
+        if (!value) return null;
+        const str = String(value).trim();
+        if (!str) return null;
+        
+        if (str.includes('/')) {
+            const parts = str.split('/');
+            if (parts.length === 3) {
+                let part1 = parts[0].trim();
+                let part2 = parts[1].trim();
+                let part3 = parts[2].trim();
+                
+                const p1 = parseInt(part1);
+                const p2 = parseInt(part2);
+                
+                let day, month, year;
+                
+                if (p1 <= 12 && p2 <= 31) {
+                    month = part1.padStart(2, '0');
+                    day = part2.padStart(2, '0');
+                } else if (p1 > 12 && p2 <= 12) {
+                    day = part1.padStart(2, '0');
+                    month = part2.padStart(2, '0');
+                } else if (part1.length === 4) {
+                    year = part1;
+                    month = part2.padStart(2, '0');
+                    day = part3.padStart(2, '0');
+                    if (parseInt(year) > 2400) year = parseInt(year) - 543;
+                    return `${year}-${month}-${day}`;
+                } else {
+                    day = '01';
+                    month = '01';
+                }
+                
+                year = part3;
+                if (year.length === 2) {
+                    year = 2000 + parseInt(year);
+                }
+                if (year.length === 4 && parseInt(year) > 2400) {
+                    year = parseInt(year) - 543;
+                }
+                
+                return `${year}-${month}-${day}`;
+            }
+        }
+        
+        if (str.includes('-') && str.includes(':')) {
+            const match = str.match(/(\d{4}-\d{2}-\d{2})/);
+            if (match) return match[1];
+        }
+        
+        if (str.includes('-') && str.length >= 10) {
+            const parts = str.split('-');
+            if (parts.length === 3) {
+                let year = parts[0];
+                let month = parts[1].padStart(2, '0');
+                let day = parts[2].padStart(2, '0');
+                if (day.length > 2) day = day.substring(0, 2);
+                if (parseInt(year) > 2400) year = parseInt(year) - 543;
+                return `${year}-${month}-${day}`;
+            }
+            return str.slice(0, 10);
+        }
+        
+        return null;
+    }
+
+    // ─── PARSE TIME ───
+    static parseTime(value) {
+        if (!value) return null;
+        const str = String(value).trim();
+        if (!str) return null;
+        
+        if (str.includes(':')) {
+            const parts = str.split(':');
+            if (parts.length >= 2) {
+                const hour = parts[0].padStart(2, '0');
+                const minute = parts[1].padStart(2, '0');
+                return `${hour}:${minute}`;
+            }
+        }
+        
+        const match = str.match(/(\d{2}:\d{2}):\d{2}/);
+        if (match) return match[1];
+        
+        return null;
+    }
+
+    // ─── API FUNCTIONS ───
+    static async getDaySummary(date) {
+        const opDay = await executeQuery(`
+            SELECT * FROM PayrollOperationDays WHERE operationDate = @date
+        `, { date });
+
+        if (opDay.recordset.length === 0) {
+            return { operationDate: date, status: 'draft', totalVehicles: 0, totalEmployees: 0, totalFare: 0, vehicles: [] };
+        }
+
+        const trips = await executeQuery(`
+            SELECT vt.*, st.shiftCode, st.shiftName, st.fareType as shiftFareType,
+                   v.displayNumber, v.plate,
+                   v.driver AS defaultDriverName,
+                   de.name AS confirmedDriverName
+            FROM PayrollVehicleTrips vt
+            INNER JOIN PayrollShiftTypes st ON vt.shiftTypeId = st.id
+            INNER JOIN Vehicles v ON vt.vehicleId = v.id
+            LEFT JOIN Employees de ON vt.driverCardId COLLATE DATABASE_DEFAULT = de.cardId COLLATE DATABASE_DEFAULT
+            WHERE vt.operationDate = @date AND vt.status != 'deleted'
+            ORDER BY st.displayOrder, vt.vehicleId
+        `, { date });
+
+        const vehicleTrips = [];
+        for (const trip of trips.recordset) {
+            const employees = await executeQuery(`
+                SELECT te.*, e.name
+                FROM PayrollTripEmployees te
+                INNER JOIN Employees e ON te.employeeId = e.id
+                WHERE te.vehicleTripId = @tripId
+            `, { tripId: trip.id });
+
+            vehicleTrips.push({
+                ...trip,
+                employees: employees.recordset
+            });
+        }
+
+        return {
+            operationDay: opDay.recordset[0],
+            vehicles: vehicleTrips,
+            totalVehicles: vehicleTrips.length,
+            totalEmployees: vehicleTrips.reduce((sum, t) => sum + (t.totalRiders || 0), 0),
+            totalFare: vehicleTrips.reduce((sum, t) => sum + (t.totalFare || 0), 0)
+        };
+    }
+
+    static async getMonthSummary(yearMonth) {
+        const [year, month] = yearMonth.split('-').map(Number);
+        const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
+        const endDate = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
+
+        const result = await executeQuery(`
+            SELECT 
+                od.operationDate,
+                od.status,
+                od.totalVehicles,
+                od.totalEmployees,
+                od.totalFare
+            FROM PayrollOperationDays od
+            WHERE od.operationDate BETWEEN @startDate AND @endDate
+            ORDER BY od.operationDate
+        `, { startDate, endDate });
+
+        return result.recordset;
+    }
+
+    // ─── GET UNMATCHED ───
+    // ✅ รวม 3 กลุ่มไว้ในลิสต์เดียวกัน (ไม่แยกแท็บย่อย ตามที่ตกลงกันไว้):
+    //    1) 'unmatched'          — คนที่สแกนเข้ามาแต่ไม่มีตัวตนใน Employees เลย (PayrollUnmatchedPersons)
+    //    2) 'fare_alert'         — คนที่มีตัวตนแล้วแต่ค่ารถผิดปกติ (PayrollFareAlerts)
+    //    3) 'incomplete_employee'— คนที่มีตัวตนใน Employees แล้ว แต่ยังไม่มีค่ารถ (fare=0)
+    //                              หรือยังไม่มีรถประจำ (defaultVehicleId ว่าง) — เดิมกลุ่มนี้
+    //                              จะขึ้นแค่ "🚐 ไม่ระบุรถ" ในหน้าจัดการวันนี้ แต่ไม่เคยโผล่ตรง
+    //                              Unmatched เลย ทั้งที่ต้องจัดการที่เดียวกัน (กรอกค่ารถ/รถประจำ)
+    static async getUnmatched(status, page, limit) {
+        const offset = (page - 1) * limit;
+        
+        const query = `
+            SELECT 
+                id,
+                cardId,
+                firstName,
+                lastName,
+                departmentRaw,
+                vehicleRaw,
+                shiftRaw,
+                status,
+                'unmatched' as type,
+                NULL as reason,
+                createdAt
+            FROM PayrollUnmatchedPersons
+            WHERE 1=1 ${status ? 'AND status = @status' : ''}
+            
+            UNION ALL
+            
+            SELECT 
+                id,
+                cardId,
+                nameSnapshot as firstName,
+                '' as lastName,
+                '' as departmentRaw,
+                '' as vehicleRaw,
+                '' as shiftRaw,
+                status,
+                'fare_alert' as type,
+                reason,
+                createdAt
+            FROM PayrollFareAlerts
+            WHERE 1=1 ${status ? 'AND status = @status' : ''}
+            AND status = 'pending'
+
+            UNION ALL
+
+            SELECT
+                id,
+                cardId COLLATE DATABASE_DEFAULT as cardId,
+                firstName COLLATE DATABASE_DEFAULT as firstName,
+                lastName COLLATE DATABASE_DEFAULT as lastName,
+                department COLLATE DATABASE_DEFAULT as departmentRaw,
+                CAST(defaultVehicleNumber AS NVARCHAR(100)) COLLATE DATABASE_DEFAULT as vehicleRaw,
+                '' as shiftRaw,
+                'pending' as status,
+                'incomplete_employee' as type,
+                CASE WHEN ISNULL(fare, 0) = 0 THEN 'ไม่มีค่ารถ'
+                     WHEN defaultVehicleId IS NULL THEN 'ไม่มีรถประจำ'
+                     ELSE 'ไม่มีค่ารถ/รถประจำ' END as reason,
+                createdAt
+            FROM Employees
+            WHERE status = 'active' AND isDriver = 0
+              AND (ISNULL(fare, 0) = 0 OR defaultVehicleId IS NULL)
+              ${status && status !== 'pending' ? 'AND 1=0' : ''}
+            
+            ORDER BY createdAt DESC
+            OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
+        `;
+
+        const params = { offset, limit };
+        if (status) params.status = status;
+
+        const result = await executeQuery(query, params);
+
+        const countQuery = `
+            SELECT 
+                (SELECT COUNT(*) FROM PayrollUnmatchedPersons WHERE 1=1 ${status ? 'AND status = @status' : ''}) +
+                (SELECT COUNT(*) FROM PayrollFareAlerts WHERE 1=1 ${status ? 'AND status = @status' : ''} AND status = 'pending') +
+                (SELECT COUNT(*) FROM Employees WHERE status = 'active' AND isDriver = 0
+                    AND (ISNULL(fare, 0) = 0 OR defaultVehicleId IS NULL)
+                    ${status && status !== 'pending' ? 'AND 1=0' : ''})
+                as total
+        `;
+        const countResult = await executeQuery(countQuery, status ? { status } : {});
+
+        return {
+            items: result.recordset,
+            total: countResult.recordset[0]?.total || 0,
+            page,
+            limit
+        };
+    }
+
+    // ─── GET UNMATCHED — รายการเดียว ระบุ type ชัดเจน (id ชนกันได้ข้าม 3 ตาราง) ───
+    static async getUnmatchedById(type, id) {
+        if (type === 'fare_alert') {
+            const result = await executeQuery(`
+                SELECT id, cardId, nameSnapshot as firstName, '' as lastName,
+                       '' as departmentRaw, '' as vehicleRaw, '' as shiftRaw,
+                       status, 'fare_alert' as type, reason, createdAt
+                FROM PayrollFareAlerts WHERE id = @id
+            `, { id });
+            return result.recordset[0] || null;
+        }
+        if (type === 'incomplete_employee') {
+            const result = await executeQuery(`
+                SELECT id, cardId, firstName, lastName, department as departmentRaw,
+                       CAST(defaultVehicleNumber AS NVARCHAR(100)) as vehicleRaw, '' as shiftRaw,
+                       'pending' as status, 'incomplete_employee' as type,
+                       fare, defaultVehicleId, defaultVehicleNumber, section, createdAt
+                FROM Employees WHERE id = @id
+            `, { id });
+            return result.recordset[0] || null;
+        }
+        // default: 'unmatched'
+        const result = await executeQuery(`
+            SELECT id, cardId, firstName, lastName, departmentRaw, vehicleRaw, shiftRaw,
+                   status, 'unmatched' as type, NULL as reason, createdAt
+            FROM PayrollUnmatchedPersons WHERE id = @id
+        `, { id });
+        return result.recordset[0] || null;
+    }
+
+    // ─── GET UNMATCHED เฉพาะของวันที่ระบุ (ใช้โดยหน้าจัดการวันนี้ เพื่อรวมคนกลุ่มนี้
+    //     เข้าไปแสดงในลิสต์ "🚐 ไม่ระบุรถ" ของรอบเวลานั้นๆ ไปเลย) ───
+    // ⚠️ หมายเหตุ: PayrollUnmatchedPersons เก็บ scanRowId ของ "แถวสแกนแรก" ที่เจอ
+    //    คนนี้เป็น unmatched เท่านั้น (กันซ้ำด้วย cardId ตอน insert) ถ้าคนคนนี้สแกน
+    //    ซ้ำในหลายวันขณะที่ยัง pending อยู่ จะยึด scanDate ของแถวแรกเป็นหลัก —
+    //    ตรงกับพฤติกรรมที่ตกลงกันไว้ (ผ่าน scanDate ของ PayrollScanRows)
+    static async getUnmatchedByDate(date) {
+        const unmatchedResult = await executeQuery(`
+            SELECT up.id, up.cardId, up.firstName, up.lastName, up.departmentRaw,
+                   up.vehicleRaw, up.shiftRaw, up.status, 'unmatched' as type,
+                   NULL as reason, up.createdAt, sr.scanTime
+            FROM PayrollUnmatchedPersons up
+            INNER JOIN PayrollScanRows sr ON sr.id = up.scanRowId
+            WHERE up.status = 'pending' AND CAST(sr.scanDate AS DATE) = @date
+        `, { date });
+
+        // ✅ พนักงานที่มีข้อมูลไม่ครบ (ไม่มีค่ารถ/รถประจำ) และมีสแกนเข้ามาในวันนี้
+        const incompleteResult = await executeQuery(`
+            SELECT DISTINCT e.id, e.cardId, e.firstName, e.lastName, e.department as departmentRaw,
+                   CAST(e.defaultVehicleNumber AS NVARCHAR(100)) as vehicleRaw, '' as shiftRaw,
+                   'pending' as status, 'incomplete_employee' as type,
+                   CASE WHEN ISNULL(e.fare, 0) = 0 THEN 'ไม่มีค่ารถ' ELSE 'ไม่มีรถประจำ' END as reason,
+                   e.createdAt, sr.scanTime
+            FROM Employees e
+            INNER JOIN PayrollScanRows sr ON sr.matchedEmployeeId = e.id
+            WHERE e.status = 'active' AND e.isDriver = 0
+              AND (ISNULL(e.fare, 0) = 0 OR e.defaultVehicleId IS NULL)
+              AND CAST(sr.scanDate AS DATE) = @date
+        `, { date });
+
+        const items = [...unmatchedResult.recordset, ...incompleteResult.recordset].map(r => {
+            let shiftCode = this.getShiftByTime(r.scanTime);
+            if (shiftCode === 'UNKNOWN') shiftCode = 'D';
+            return { ...r, shiftCodeGuess: shiftCode };
+        });
+
+        if (items.length === 0) return items;
+
+        const shiftTypesResult = await executeQuery(`SELECT id, shiftCode FROM PayrollShiftTypes`);
+        const shiftIdByCode = {};
+        for (const s of shiftTypesResult.recordset) shiftIdByCode[s.shiftCode] = s.id;
+
+        return items.map(r => ({
+            ...r,
+            shiftTypeId: shiftIdByCode[r.shiftCodeGuess] || null
+        }));
+    }
+
+    // ✅ data.type บอกว่ารายการนี้มาจากกลุ่มไหนในแท็บ Unmatched (รวมกลุ่มเดียวกันแล้ว
+    //    แต่ปุ่ม "บันทึก" ต้องรู้ว่าจะ INSERT พนักงานใหม่ หรือ UPDATE คนที่มีอยู่แล้ว)
+    static async createEmployeeFromUnmatched(id, data) {
+        const type = data.type || 'unmatched';
+        // 🔧 log ตัวเต็มของ request นี้ทันทีตอนเข้าฟังก์ชัน เพื่อดูให้ชัดว่า id/type/
+        //    defaultVehicleId ที่ "รายการนี้จริง ๆ" ได้รับมาคืออะไร แยกจาก request อื่น
+        //    ที่อาจยิงเข้ามาใกล้ ๆ กัน (เช่นกดสร้างพนักงานหลายคนติดกัน)
+        console.log(`🔧 createEmployeeFromUnmatched เริ่ม — id=${id}, type=${type}, data=`, JSON.stringify(data));
+
+        // ─── กรณีที่ 3: พนักงานมีตัวตนอยู่แล้วใน Employees แค่ข้อมูลไม่ครบ
+        //     (ไม่มีค่ารถ/รถประจำ) → UPDATE คนเดิม ไม่ใช่สร้างใหม่ ───
+        if (type === 'incomplete_employee') {
+            const empCheck = await executeQuery(`SELECT id, firstName, lastName FROM Employees WHERE id = @id`, { id });
+            if (empCheck.recordset.length === 0) {
+                throw new Error('ไม่พบพนักงาน หรือถูกลบไปแล้ว');
+            }
+            const cur = empCheck.recordset[0];
+
+            let defaultVehicleNumber = null;
+            let resolvedVehicleId = null;
+            if (data.defaultVehicleId) {
+                const veh = await resolveVehicleByAnyId(data.defaultVehicleId);
+                if (veh) {
+                    resolvedVehicleId = veh.id;
+                    defaultVehicleNumber = safeVehicleNumberForColumn(veh);
+                }
+                // ถ้าหาไม่เจอเลย (id ก็ไม่ใช่ เบอร์รถก็ไม่ตรง) ปล่อยเป็น null แทนที่จะ
+                // ทำให้ทั้ง request ล้มเหลว — แอดมินยังบันทึกค่ารถได้ แค่ไม่มีรถประจำ
+            }
+
+            await executeQuery(`
+                UPDATE Employees SET
+                    fare = @fare,
+                    defaultVehicleId = @defaultVehicleId,
+                    defaultVehicleNumber = @defaultVehicleNumber,
+                    updatedAt = GETDATE()
+                WHERE id = @id
+            `, {
+                id,
+                fare: (data.fare !== undefined && data.fare !== null && data.fare !== '') ? data.fare : 0,
+                defaultVehicleId: resolvedVehicleId,
+                defaultVehicleNumber
+            });
+
+            return { employeeId: id, name: `${cur.firstName || ''} ${cur.lastName || ''}`.trim() };
+        }
+
+        const unmatched = await executeQuery(`
+            SELECT * FROM PayrollUnmatchedPersons WHERE id = @id AND status = 'pending'
+        `, { id });
+
+        if (unmatched.recordset.length === 0) {
+            throw new Error('ไม่พบข้อมูล Unmatched หรือถูกสร้างไปแล้ว');
+        }
+
+        const row = unmatched.recordset[0];
+        const finalCardId = data.cardId || row.cardId;
+        const cardIdTrimmed = finalCardId ? String(finalCardId).trim() : '';
+
+        // ✅ เลขรถประจำ: รับ defaultVehicleId จากฟอร์ม แล้วดึง defaultVehicleNumber
+        //    (เบอร์แสดงผล) มาเก็บคู่กันไว้เลย เดิมฟอร์มนี้ไม่มีช่องรถประจำ ทำให้
+        //    พนักงานที่สร้างจาก Unmatched ไม่มีวันมีรถประจำ ต้องไปกรอกทีหลังเสมอ
+        let defaultVehicleNumber = null;
+        let resolvedVehicleId = null;
+        if (data.defaultVehicleId) {
+            const veh = await resolveVehicleByAnyId(data.defaultVehicleId);
+            if (veh) {
+                resolvedVehicleId = veh.id;
+                defaultVehicleNumber = safeVehicleNumberForColumn(veh);
+            }
+        }
+
+        // ✅ กันสร้างพนักงานซ้ำ: ถ้ามี cardId นี้ใน Employees อยู่แล้ว ใช้ id เดิม ไม่ insert ใหม่
+        let employeeId;
+        if (cardIdTrimmed) {
+            const existingEmp = await executeQuery(`
+                SELECT id FROM Employees WHERE cardId = @cardId
+            `, { cardId: cardIdTrimmed });
+            if (existingEmp.recordset.length > 0) {
+                employeeId = existingEmp.recordset[0].id;
+                // ✅ ถ้ามีพนักงานอยู่แล้ว (เช่นสร้างไว้ก่อนหน้าแต่ยังไม่ครบข้อมูล) ให้อัปเดต
+                //    ค่ารถ/รถประจำที่กรอกรอบนี้ทับเข้าไปด้วย ไม่ใช่แค่จับคู่เฉยๆ
+                await executeQuery(`
+                    UPDATE Employees SET
+                        fare = @fare,
+                        defaultVehicleId = @defaultVehicleId,
+                        defaultVehicleNumber = @defaultVehicleNumber,
+                        updatedAt = GETDATE()
+                    WHERE id = @id
+                `, {
+                    id: employeeId,
+                    fare: data.fare || 0,
+                    defaultVehicleId: resolvedVehicleId,
+                    defaultVehicleNumber
+                });
+            }
+        }
+
+        if (!employeeId) {
+            const result = await executeQuery(`
+                INSERT INTO Employees (
+                    cardId, firstName, lastName, name, department, section, fare,
+                    defaultVehicleId, defaultVehicleNumber, status, isDriver
+                ) OUTPUT INSERTED.id
+                VALUES (
+                    @cardId, @firstName, @lastName, @name, @department, @section, @fare,
+                    @defaultVehicleId, @defaultVehicleNumber, 'active', 0
+                )
+            `, {
+                cardId: finalCardId,
+                firstName: data.firstName || row.firstName || '',
+                lastName: data.lastName || row.lastName || '',
+                name: `${data.firstName || row.firstName || ''} ${data.lastName || row.lastName || ''}`.trim() || row.cardId,
+                department: data.department || row.departmentRaw || 'ไม่ระบุ',
+                section: data.section || '',
+                fare: data.fare || 0,
+                defaultVehicleId: resolvedVehicleId,
+                defaultVehicleNumber
+            });
+            employeeId = result.recordset[0].id;
+        }
+
+        // ✅ ปิดทุกแถว pending ใน PayrollUnmatchedPersons ที่เป็น cardId เดียวกัน ไม่ใช่แค่แถวที่กด
+        //    (เผื่อยังมี record เก่าที่ insert ซ้ำไว้ก่อนแก้บั๊ก dedupe หรือกรณี cardId ว่างที่ fallback เป็น scanRowId)
+        if (cardIdTrimmed) {
+            await executeQuery(`
+                UPDATE PayrollUnmatchedPersons SET
+                    status = 'created',
+                    createdEmployeeId = @employeeId,
+                    updatedAt = GETDATE()
+                WHERE cardId = @cardId AND status = 'pending'
+            `, { cardId: cardIdTrimmed, employeeId });
+        } else {
+            await executeQuery(`
+                UPDATE PayrollUnmatchedPersons SET
+                    status = 'created',
+                    createdEmployeeId = @employeeId,
+                    updatedAt = GETDATE()
+                WHERE id = @id
+            `, { id, employeeId });
+        }
+
+        // ✅ จับคู่ย้อนหลังทุกวัน ทุกแถว scan ของ cardId นี้ที่เคยเป็น unmatched (ไม่ใช่แค่ scanRowId เดียว)
+        //    ข้อนี้สำคัญที่สุด: ป้องกันไม่ให้วันอื่นๆ ของพนักงานคนนี้หลุดจากการคำนวณค่ารถ
+        if (cardIdTrimmed) {
+            await executeQuery(`
+                UPDATE PayrollScanRows SET
+                    matchedEmployeeId = @employeeId,
+                    processedStatus = 'matched'
+                WHERE cardId = @cardId AND processedStatus = 'unmatched'
+            `, { employeeId, cardId: cardIdTrimmed });
+        } else {
+            await executeQuery(`
+                UPDATE PayrollScanRows SET
+                    matchedEmployeeId = @employeeId,
+                    processedStatus = 'matched'
+                WHERE id = @scanRowId
+            `, { employeeId, scanRowId: row.scanRowId });
+        }
+
+        return { employeeId, name: `${data.firstName || row.firstName || ''} ${data.lastName || row.lastName || ''}`.trim() };
+    }
+
+    // ─── ปิดรายการ Unmatched ของ cardId ที่เพิ่งจับคู่เจอ (ใช้ร่วมกันทั้งจาก
+    //     classifyRows ตอนประมวลผล/นำเข้าใหม่ และจาก createEmployeeFromUnmatched) ───
+    static async closeUnmatchedByCardId(cardId, employeeId) {
+        const trimmed = cardId ? String(cardId).trim() : '';
+        if (!trimmed) return;
+        await executeQuery(`
+            UPDATE PayrollUnmatchedPersons SET
+                status = 'created',
+                createdEmployeeId = @employeeId,
+                updatedAt = GETDATE()
+            WHERE cardId = @cardId AND status = 'pending'
+        `, { cardId: trimmed, employeeId });
+    }
+
+    static async ignoreUnmatched(id) {
+        await executeQuery(`
+            UPDATE PayrollUnmatchedPersons SET status = 'ignored', updatedAt = GETDATE()
+            WHERE id = @id AND status = 'pending'
+        `, { id });
+        return { id, status: 'ignored' };
+    }
+
+    // ─── IGNORE UNASSIGNED RIDER (ลบออกจากแบนเนอร์ "ยังไม่ถูกจัดขึ้นรถ" โดยไม่จัดรถให้) ───
+    //    ใช้ตอนกดปุ่ม "ลบ" ที่หน้า Daily — คนละเคสกับ resolveUnassignedRider (ที่จัดขึ้นรถจริง)
+    //    แค่ mark สถานะเป็น 'ignored' คนนี้จะหายไปจากแบนเนอร์ (filter เอาเฉพาะ 'pending')
+    //    แต่ยังอยู่ใน DB เพื่อดูย้อนหลังได้ ไม่ได้ถูกลบทิ้งจริง
+    static async ignoreUnassignedRider(id) {
+        const result = await executeQuery(`
+            UPDATE PayrollUnassignedRiders SET status = 'ignored', updatedAt = GETDATE()
+            WHERE id = @id AND status = 'pending'
+        `, { id });
+        if (result.rowsAffected[0] === 0) {
+            throw new Error('ไม่พบรายการนี้ หรือถูกจัดการไปแล้ว');
+        }
+        return { id, status: 'ignored' };
+    }
+
+    // ─── GET SETTINGS ───
+    static async getSettings() {
+        const shiftTypes = await executeQuery(`
+            SELECT * FROM PayrollShiftTypes ORDER BY displayOrder
+        `);
+
+        const rates = await executeQuery(`
+            SELECT * FROM PayrollRateSettings WHERE isActive = 1 ORDER BY shiftCode
+        `);
+
+        return {
+            shiftTypes: shiftTypes.recordset,
+            rates: rates.recordset
+        };
+    }
+
+    static async updateRate(shiftCode, rate, effectiveFrom) {
+        const effectiveDate = effectiveFrom || new Date().toISOString().split('T')[0];
+        
+        await executeQuery(`
+            UPDATE PayrollRateSettings SET isActive = 0, effectiveTo = DATEADD(day, -1, @effectiveFrom)
+            WHERE shiftCode = @shiftCode AND isActive = 1
+        `, { shiftCode, effectiveFrom: effectiveDate });
+
+        const result = await executeQuery(`
+            INSERT INTO PayrollRateSettings (shiftCode, rateType, rate, effectiveFrom, isActive)
+            OUTPUT INSERTED.id
+            VALUES (@shiftCode, @rateType, @rate, @effectiveFrom, 1)
+        `, {
+            shiftCode,
+            rateType: 'perTrip',
+            rate,
+            effectiveFrom: effectiveDate
+        });
+
+        return { id: result.recordset[0].id, shiftCode, rate, effectiveFrom: effectiveDate };
+    }
+
+    static async getReport(startDate, endDate) {
+        const trips = await executeQuery(`
+            SELECT 
+                vt.id,
+                vt.operationDate,
+                vt.shiftTypeId,
+                vt.vehicleId,
+                vt.driverCardId,
+                vt.fareType,
+                vt.fareUsed,
+                vt.totalFare,
+                vt.totalRiders,
+                vt.isManualOverride,
+                vt.tripSeq,
+                vt.status,
+                vt.note,
+                vt.createdBy,
+                vt.updatedBy,
+                vt.createdAt,
+                vt.updatedAt,
+                st.shiftCode, 
+                st.shiftName,
+                st.fareType AS shiftFareType,
+                v.displayNumber, 
+                v.plate, 
+                v.driver,
+                COUNT(te.id) as employeeCount,
+                ISNULL(SUM(te.fare), 0) as totalEmployeeFare
+            FROM PayrollVehicleTrips vt
+            INNER JOIN PayrollShiftTypes st ON vt.shiftTypeId = st.id
+            INNER JOIN Vehicles v ON vt.vehicleId = v.id
+            LEFT JOIN PayrollTripEmployees te ON te.vehicleTripId = vt.id
+            WHERE vt.operationDate BETWEEN @startDate AND @endDate
+            AND vt.status != 'deleted'
+            GROUP BY 
+                vt.id, 
+                vt.operationDate, 
+                vt.shiftTypeId, 
+                vt.vehicleId,
+                vt.driverCardId, 
+                vt.fareType, 
+                vt.fareUsed, 
+                vt.totalFare,
+                vt.totalRiders, 
+                vt.isManualOverride,
+                vt.tripSeq, 
+                vt.status, 
+                vt.note,
+                vt.createdBy, 
+                vt.updatedBy, 
+                vt.createdAt, 
+                vt.updatedAt,
+                st.shiftCode, 
+                st.shiftName,
+                st.fareType,
+                v.displayNumber, 
+                v.plate, 
+                v.driver
+            ORDER BY vt.operationDate, st.shiftCode
+        `, { startDate, endDate });
+
+        // ✅ group ตาม "รถ + รอบ (shiftCode)" แยกกัน — ถ้าช่วงวันที่เลือกมีหลายวัน
+        //    จะ sum รวมให้อัตโนมัติต่อคู่ (vehicleId, shiftCode) เดียวกัน
+        const vehicleSummary = {};
+        for (const trip of trips.recordset) {
+            const key = `${trip.vehicleId}_${trip.shiftCode}`;
+            if (!vehicleSummary[key]) {
+                vehicleSummary[key] = {
+                    vehicleId: trip.vehicleId,
+                    displayNumber: trip.displayNumber,
+                    plate: trip.plate,
+                    driver: trip.driver,
+                    shiftCode: trip.shiftCode,
+                    shiftName: trip.shiftName,
+                    totalTrips: 0,
+                    totalFare: 0,
+                    totalRiders: 0
+                };
+            }
+            vehicleSummary[key].totalTrips += 1;
+            vehicleSummary[key].totalFare += trip.totalFare || 0;
+            vehicleSummary[key].totalRiders += trip.totalRiders || 0;
+        }
+
+        // เรียงตามเบอร์รถ แล้วตามรอบ ให้ดูง่ายเวลาแสดงผล/export
+        const vehicleSummaryList = Object.values(vehicleSummary).sort((a, b) => {
+            const numA = String(a.displayNumber ?? a.vehicleId);
+            const numB = String(b.displayNumber ?? b.vehicleId);
+            const cmp = numA.localeCompare(numB, 'th', { numeric: true });
+            if (cmp !== 0) return cmp;
+            return String(a.shiftCode || '').localeCompare(String(b.shiftCode || ''));
+        });
+
+        // ✅ group ซ้อนอีกชั้น: รถ -> รอบ (สำหรับตารางหลักแบบ pivot ในหน้ารายงานใหม่)
+        //    เช่น รถเบอร์ 2 -> { D: {...}, N: {...} } พร้อมยอดรวมทั้งคัน
+        const vehicleMap = {};
+        for (const row of vehicleSummaryList) {
+            if (!vehicleMap[row.vehicleId]) {
+                vehicleMap[row.vehicleId] = {
+                    vehicleId: row.vehicleId,
+                    displayNumber: row.displayNumber,
+                    plate: row.plate,
+                    driver: row.driver,
+                    shifts: {},
+                    totalTrips: 0,
+                    totalRiders: 0,
+                    totalFare: 0
+                };
+            }
+            const vm = vehicleMap[row.vehicleId];
+            vm.shifts[row.shiftCode] = {
+                shiftCode: row.shiftCode,
+                shiftName: row.shiftName,
+                totalTrips: row.totalTrips,
+                totalRiders: row.totalRiders,
+                totalFare: row.totalFare
+            };
+            vm.totalTrips += row.totalTrips;
+            vm.totalRiders += row.totalRiders;
+            vm.totalFare += row.totalFare;
+        }
+        const vehicles = Object.values(vehicleMap).sort((a, b) =>
+            String(a.displayNumber ?? a.vehicleId).localeCompare(String(b.displayNumber ?? b.vehicleId), 'th', { numeric: true })
+        );
+
+        // ลำดับคอลัมน์รอบ: D ก่อน, N รองลงมา, ที่เหลือเรียงตามชื่อ (เผื่อมีรอบที่สร้างเองเพิ่ม)
+        const shiftPriority = (code) => (code === 'D' ? 0 : code === 'N' ? 1 : 2);
+        const shiftColumnMap = {};
+        for (const row of vehicleSummaryList) {
+            if (!shiftColumnMap[row.shiftCode]) {
+                shiftColumnMap[row.shiftCode] = { shiftCode: row.shiftCode, shiftName: row.shiftName };
+            }
+        }
+        const shiftColumns = Object.values(shiftColumnMap).sort((a, b) => {
+            const p = shiftPriority(a.shiftCode) - shiftPriority(b.shiftCode);
+            if (p !== 0) return p;
+            return String(a.shiftCode).localeCompare(String(b.shiftCode));
+        });
+
+        // ✅ วันที่ที่มีข้อมูลจริงในช่วงที่เลือก เรียงจากน้อยไปมาก (ใช้ทำชีทแยกรายวัน)
+        const dateSet = new Set();
+        for (const t of trips.recordset) {
+            let d = t.operationDate;
+            if (d instanceof Date) {
+                d = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            } else {
+                d = String(d).slice(0, 10);
+            }
+            dateSet.add(d);
+        }
+        const dates = Array.from(dateSet).sort();
+
+        return {
+            startDate,
+            endDate,
+            dates,
+            trips: trips.recordset,
+            vehicleSummary: vehicleSummaryList,
+            vehicles,
+            shiftColumns,
+            pivotRows: this.buildVehiclePivot(trips.recordset),
+            grandTotal: vehicleSummaryList.reduce((s, v) => s + v.totalFare, 0)
+        };
+    }
+
+    // ─── สร้างตารางรถ x รอบ แบบละเอียด (คอลัมน์ตามที่หน้างานใช้จริง) ───
+    //    เข้าเช้า D / ออกกะ N: รายหัว (perHead) — นับ "คน" จาก employeeCount จริง
+    //    17:00: เหมาคัน (flatByVehicle) — นับ "คนเลิกงาน" ที่ถูกจัดขึ้นรถ (ไม่ได้เอามาคิดค่าหัว)
+    //    20:00: ตามจำนวนเที่ยว (perTrip) — นับ "เที่ยว" จาก tripSeq (ไม่ใช่จำนวนคน)
+    //    รอบอื่นๆ ที่เป็น perHead (เช่น 16:00 เข้า/ออก) ที่ไม่มีคอลัมน์ตายตัว จะถูกรวมเข้า
+    //    "รวมคน D+N" / "รวมราคา D+N" ด้วย (เพราะคิดค่าหัวเหมือนกัน) แต่ไม่มีคอลัมน์แยกให้ดู
+    //    เว้นแต่จะมีรอบนั้นเกิดขึ้นจริงในช่วงวันที่เลือก ถึงจะเพิ่มคอลัมน์แยกให้อัตโนมัติ
+    static buildVehiclePivot(tripRows) {
+        const byVehicle = {};
+        const extraPerHeadShifts = new Set(); // เก็บโค้ดรอบ perHead อื่นๆ ที่เจอ (นอกจาก D/N)
+
+        for (const t of tripRows) {
+            const vId = t.vehicleId;
+            if (!byVehicle[vId]) {
+                byVehicle[vId] = {
+                    vehicleId: vId,
+                    displayNumber: t.displayNumber,
+                    plate: t.plate,
+                    driver: t.driver,
+                    inD: { riders: 0, fare: 0 },
+                    outN: { riders: 0, fare: 0 },
+                    flat17: { riders: 0, fare: 0 },
+                    night20: { trips: 0, fare: 0 },
+                    extraPerHead: {}, // { shiftCode: { shiftName, riders, fare } }
+                    grandTotal: 0
+                };
+            }
+            const row = byVehicle[vId];
+            // ✅ ถ้าเที่ยวนี้ถูก "ปรับยอดเอง" (isManualOverride) ให้ใช้ totalRiders ที่แอดมิน
+            //    กำหนดไว้ตรงๆ แทน employeeCount (นับจากรายชื่อที่สแกนได้จริง) เพราะรายชื่อ
+            //    อาจไม่ครบ (เช่น พนักงานออกโดยไม่ได้แตะบัตร) แต่จำนวนที่ถูกต้องจริงถูกระบุไว้แล้ว
+            const riders = t.isManualOverride ? (t.totalRiders || 0) : (t.employeeCount || 0);
+            const fare = t.totalFare || 0;
+            row.grandTotal += fare;
+
+            if (t.shiftCode === 'D') {
+                row.inD.riders += riders;
+                row.inD.fare += fare;
+            } else if (t.shiftCode === 'N') {
+                row.outN.riders += riders;
+                row.outN.fare += fare;
+            } else if (t.shiftCode === 'EVENING_17') {
+                row.flat17.riders += riders;
+                row.flat17.fare += fare;
+            } else if (t.shiftCode === 'NIGHT_20') {
+                row.night20.trips += (t.tripSeq || 1);
+                row.night20.fare += fare;
+            } else if (t.shiftFareType === 'perHead') {
+                if (!row.extraPerHead[t.shiftCode]) {
+                    row.extraPerHead[t.shiftCode] = { shiftName: t.shiftName || t.shiftCode, riders: 0, fare: 0 };
+                }
+                row.extraPerHead[t.shiftCode].riders += riders;
+                row.extraPerHead[t.shiftCode].fare += fare;
+                extraPerHeadShifts.add(t.shiftCode);
+            }
+        }
+
+        const rows = Object.values(byVehicle).map(row => {
+            let perHeadRiders = row.inD.riders + row.outN.riders;
+            let perHeadFare = row.inD.fare + row.outN.fare;
+            for (const code of Object.keys(row.extraPerHead)) {
+                perHeadRiders += row.extraPerHead[code].riders;
+                perHeadFare += row.extraPerHead[code].fare;
+            }
+            // ✅ เปอร์เซ็นต่อหัว = ราคาเฉลี่ยต่อคน (รวมราคา D+N หาร รวมคน D+N) ไม่ใช่ % ของยอดรวมทั้งคัน
+            const percentPerHead = perHeadRiders > 0 ? Math.round((perHeadFare / perHeadRiders) * 100) / 100 : 0;
+            return { ...row, perHeadRiders, perHeadFare, percentPerHead };
+        }).sort((a, b) =>
+            String(a.displayNumber ?? a.vehicleId).localeCompare(String(b.displayNumber ?? b.vehicleId), 'th', { numeric: true })
+        );
+
+        return { rows, extraPerHeadShiftCodes: Array.from(extraPerHeadShifts) };
+    }
+
+    // ─── ดึงรายชื่อ "พนักงานรายคน" ที่ถูกจัดขึ้นรถแล้วในช่วงวันที่ที่เลือก
+    //    (ไม่รวมคนขับ — isDriver = 0) พร้อมพยายามจับคู่เวลาสแกนจริง + ชื่อ-นามสกุล
+    //    จาก PayrollScanRows กลับมาให้ (เพราะ PayrollTripEmployees เก็บแค่
+    //    nameSnapshot รวมกัน ไม่มีคอลัมน์เวลาสแกน) เพื่อให้หน้าตาชีทออกมาใกล้เคียง
+    //    ไฟล์สแกนดิบที่สุด ───
+    static async getReportEmployeeDetails(startDate, endDate) {
+        const rowsResult = await executeQuery(`
+            SELECT
+                te.id AS tripEmployeeId,
+                te.cardId,
+                te.nameSnapshot,
+                te.department,
+                te.fare,
+                te.fareSource,
+                vt.operationDate,
+                st.shiftCode,
+                st.shiftName,
+                st.startTime,
+                st.endTime,
+                v.displayNumber,
+                v.plate,
+                de.name AS confirmedDriverName,
+                v.driver AS defaultDriverName
+            FROM PayrollTripEmployees te
+            INNER JOIN PayrollVehicleTrips vt ON te.vehicleTripId = vt.id
+            INNER JOIN PayrollShiftTypes st ON vt.shiftTypeId = st.id
+            INNER JOIN Vehicles v ON vt.vehicleId = v.id
+            LEFT JOIN Employees de ON vt.driverCardId COLLATE DATABASE_DEFAULT = de.cardId COLLATE DATABASE_DEFAULT
+            WHERE vt.operationDate BETWEEN @startDate AND @endDate
+              AND vt.status != 'deleted'
+              AND te.isDriver = 0
+            ORDER BY vt.operationDate, st.displayOrder, v.displayNumber, te.id
+        `, { startDate, endDate });
+
+        // ✅ ดึงสแกนหน้าของ "พนักงาน" (ไม่เอาไฟล์คนขับ) ทั้งช่วงวันที่ในคำขอเดียว
+        //    เอาไว้จับคู่เวลา + ชื่อ-นามสกุลตัวจริงจากไฟล์สแกน (ไม่ใช่ nameSnapshot)
+        const scansResult = await executeQuery(`
+            SELECT cardId, scanDate, scanTime, firstName, lastName
+            FROM PayrollScanRows
+            WHERE scanDate BETWEEN @startDate AND @endDate
+              AND personType = 'employee'
+        `, { startDate, endDate });
+
+        // key: "cardId|YYYY-MM-DD" -> [{ scanTime, firstName, lastName }, ...] เรียงเวลา
+        const scansByKey = {};
+        for (const s of scansResult.recordset) {
+            let d = s.scanDate;
+            if (d instanceof Date) {
+                d = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            } else {
+                d = String(d).slice(0, 10);
+            }
+            const key = `${(s.cardId || '').trim()}|${d}`;
+            if (!scansByKey[key]) scansByKey[key] = [];
+            scansByKey[key].push({
+                scanTime: this.toHHMM(s.scanTime),
+                firstName: s.firstName || '',
+                lastName: s.lastName || ''
+            });
+        }
+        for (const key in scansByKey) {
+            scansByKey[key].sort((a, b) => (a.scanTime || '').localeCompare(b.scanTime || ''));
+        }
+
+        const details = [];
+        for (const row of rowsResult.recordset) {
+            let d = row.operationDate;
+            if (d instanceof Date) {
+                d = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            } else {
+                d = String(d).slice(0, 10);
+            }
+            const key = `${(row.cardId || '').trim()}|${d}`;
+            const scans = scansByKey[key] || [];
+
+            // ✅ หาสแกนที่ตรงกับรอบนี้จริงๆ:
+            //    - รอบ 20:00 ที่ถูกจัดผ่าน "จัดคนลงรถอัตโนมัติ" จะมี fareSource
+            //      เป็น night_in/night_out อยู่แล้ว ใช้แยกก่อน/หลัง 20:00 ได้ตรงๆ
+            //    - รอบอื่นๆ ใช้ช่วงเวลาของรอบ (shift.startTime-endTime) หาสแกนที่
+            //      ตกอยู่ในช่วงนั้น (isInTimeRange เหมือนที่จุดอื่นในระบบใช้)
+            //    - ถ้าหาไม่เจอเลย fallback เอาสแกนแรกของวันนั้นไปก่อน (ยังดีกว่าว่าง)
+            let matched = null;
+            if (row.fareSource === 'night_in') {
+                matched = scans.find(s => s.scanTime && s.scanTime < '20:00');
+            } else if (row.fareSource === 'night_out') {
+                matched = scans.find(s => s.scanTime && s.scanTime >= '20:00');
+            } else {
+                matched = scans.find(s => this.isInTimeRange(s.scanTime, row.startTime, row.endTime));
+            }
+            if (!matched) matched = scans[0] || null;
+
+            // เผื่อไม่เจอสแกนเลย (เช่น ถูกเพิ่มมือผ่าน addEmployeeToTrip โดยไม่มีสแกน)
+            // ใช้ nameSnapshot แยกคำแรก/ที่เหลือแทนชื่อ-นามสกุล
+            const [snapFirst, ...snapRest] = (row.nameSnapshot || '').split(' ');
+
+            details.push({
+                operationDate: d,
+                scanTime: matched?.scanTime || '',
+                shiftCode: row.shiftCode,
+                shiftName: row.shiftName,
+                cardId: row.cardId,
+                firstName: matched?.firstName || snapFirst || '',
+                lastName: matched?.lastName || snapRest.join(' ') || '',
+                department: row.department || '',
+                displayNumber: row.displayNumber,
+                plate: row.plate,
+                driver: row.confirmedDriverName || row.defaultDriverName || '',
+                fare: row.fare || 0,
+                // เข้างาน/ออกงาน — มีความหมายเฉพาะรอบ 20:00 ที่ผ่านการจัดคนอัตโนมัติ
+                note: row.fareSource === 'night_in' ? 'เข้างาน'
+                    : row.fareSource === 'night_out' ? 'ออกงาน'
+                    : ''
+            });
+        }
+
+        return details;
+    }
+
+    // ─── แปลงผลลัพธ์จาก buildVehiclePivot ให้เป็น sheet เดียว (aoa) ───
+    //    title/subtitle: ข้อความหัวชีท, ใส่คอลัมน์รอบ perHead พิเศษ (เช่น 16:00) ต่อท้าย
+    //    เข้า D / ออก N อัตโนมัติ ถ้ามีข้อมูลจริงในชุดนี้
+    // ─── แปลงผลลัพธ์จาก buildVehiclePivot ให้เป็นชีทสี (ExcelJS) ───
+    //    หน้าตาให้ตรงกับตาราง Reports บนหน้าเว็บ: หัวตาราง 2 แถว, กลุ่มสีตามรอบ
+    //    (D=ฟ้า, N=เขียว, extra=เหลือง, 17:00=ส้ม, 20:00=ชมพู, สรุปค่าหัว=ม่วง),
+    //    แถวลายสลับ, แถวรวมตัวหนา, freeze หัวตาราง+3 คอลัมน์แรก
+    static addPivotSheet(workbook, pivot, sheetNameRaw, title, subtitleLines = []) {
+        const extraCodes = pivot.extraPerHeadShiftCodes || [];
+        const extraNames = {};
+        for (const row of pivot.rows) {
+            for (const code of extraCodes) {
+                if (row.extraPerHead[code]) extraNames[code] = row.extraPerHead[code].shiftName;
+            }
+        }
+
+        const sheetName = xlsxUniqueSheetName(workbook, sheetNameRaw);
+        const headRowsBeforeTable = 1 + subtitleLines.length + 1; // title + subtitle + แถวว่าง
+        const ws = workbook.addWorksheet(sheetName, {
+            views: [{ state: 'frozen', xSplit: 3, ySplit: headRowsBeforeTable + 2 }],
+        });
+
+        // ─── หัวเรื่อง + วันที่ ───
+        ws.mergeCells(1, 1, 1, 3);
+        ws.getCell(1, 1).value = title;
+        ws.getCell(1, 1).font = { bold: true, size: 13, color: { argb: 'FF1E293B' } };
+        let r = 2;
+        for (const line of subtitleLines) {
+            ws.getCell(r, 1).value = line;
+            ws.getCell(r, 1).font = { size: 10, color: { argb: 'FF64748B' } };
+            r++;
+        }
+        r++; // แถวว่างคั่น
+
+        const headRow1 = r;
+        const headRow2 = r + 1;
+        const dataStart = r + 2;
+
+        // ─── โครงคอลัมน์ (ต้องเรียงตามตารางบนหน้าเว็บ) ───
+        const cols = [
+            { label1: 'เบอร์รถ', id: true, width: 10 },
+            { label1: 'ทะเบียน', id: true, width: 13 },
+            { label1: 'คนขับ', id: true, width: 18 },
+            { group: 'd', label1: '🌅 เข้าเช้า (D)', label2: 'คน', width: 9, kind: 'count' },
+            { group: 'd', label2: 'รวม(บาท)', width: 13, kind: 'fare' },
+            { group: 'n', label1: '🌆 ออกกะ (N)', label2: 'คน', width: 9, kind: 'count' },
+            { group: 'n', label2: 'รวม(บาท)', width: 13, kind: 'fare' },
+            ...extraCodes.flatMap(code => ([
+                { group: 'extra', label1: extraNames[code] || code, label2: 'คน', width: 9, kind: 'count' },
+                { group: 'extra', label2: 'รวม(บาท)', width: 13, kind: 'fare' },
+            ])),
+            { group: 'flat17', label1: '🕔 17:00', label2: 'คนเลิกงาน', width: 11, kind: 'count' },
+            { group: 'flat17', label2: 'รวม(บาท)', width: 13, kind: 'fare' },
+            { group: 'night20', label1: '🌙 20:00', label2: 'เที่ยว', width: 9, kind: 'count' },
+            { group: 'night20', label2: 'รวม(บาท)', width: 13, kind: 'fare' },
+            { total: true, label1: 'รวมทั้งหมด', width: 14, kind: 'grand' },
+            { group: 'perhead', label1: '📐 สรุปค่าหัว', label2: 'รวมคน D+N', width: 11, kind: 'count' },
+            { group: 'perhead', label2: 'รวมราคา D+N', width: 13, kind: 'fare' },
+            { group: 'perhead', label2: '฿/หัว', width: 11, kind: 'perhead' },
+        ];
+
+        ws.columns = cols.map(c => ({ width: c.width }));
+
+        // ─── วาดหัวตาราง 2 แถว (merge เหมือนหน้าเว็บ) ───
+        let ci = 1;
+        for (const c of cols) {
+            if (c.id || c.total) {
+                ws.mergeCells(headRow1, ci, headRow2, ci);
+                const cell = ws.getCell(headRow1, ci);
+                cell.value = c.label1;
+                const palette = c.total ? XLSX_COLORS.total : XLSX_COLORS.id;
+                cell.fill = xlsxFill(palette.header);
+                cell.font = { bold: true, color: { argb: palette.text } };
+                cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+                ws.getCell(headRow2, ci).fill = xlsxFill(palette.header);
+                ci++;
+                continue;
+            }
+            const palette = XLSX_COLORS[c.group];
+            if (c.label1 !== undefined) {
+                ws.mergeCells(headRow1, ci, headRow1, ci + 1);
+                const cell = ws.getCell(headRow1, ci);
+                cell.value = c.label1;
+                cell.fill = xlsxFill(palette.header);
+                cell.font = { bold: true, color: { argb: palette.text } };
+                cell.alignment = { vertical: 'middle', horizontal: 'center' };
+                ws.getCell(headRow1, ci + 1).fill = xlsxFill(palette.header);
+            }
+            const subCell = ws.getCell(headRow2, ci);
+            subCell.value = c.label2;
+            subCell.fill = xlsxFill(palette.sub || palette.header);
+            subCell.font = { bold: true, size: 10, color: { argb: palette.text } };
+            subCell.alignment = { vertical: 'middle', horizontal: 'center' };
+            ci++;
+        }
+        for (let col = 1; col <= cols.length; col++) {
+            ws.getRow(headRow1).getCell(col).border = XLSX_BORDER_ALL;
+            ws.getRow(headRow2).getCell(col).border = XLSX_BORDER_ALL;
+        }
+        ws.getRow(headRow1).height = 20;
+        ws.getRow(headRow2).height = 18;
+
+        // ─── แถวข้อมูล ───
+        let rIdx = dataStart;
+        for (const row of pivot.rows) {
+            const values = [
+                row.displayNumber, row.plate, row.driver,
+                row.inD.riders || null, row.inD.fare,
+                row.outN.riders || null, row.outN.fare,
+                ...extraCodes.flatMap(code => [
+                    row.extraPerHead[code]?.riders || null,
+                    row.extraPerHead[code]?.fare || 0,
+                ]),
+                row.flat17.riders || null, row.flat17.fare,
+                row.night20.trips || null, row.night20.fare,
+                row.grandTotal,
+                row.perHeadRiders, row.perHeadFare, row.percentPerHead,
+            ];
+            const excelRow = ws.getRow(rIdx);
+            excelRow.values = values;
+            const isEven = (rIdx - dataStart) % 2 === 1;
+            for (let col = 1; col <= cols.length; col++) {
+                const c = cols[col - 1];
+                const cell = excelRow.getCell(col);
+                cell.border = XLSX_BORDER_ALL;
+                cell.alignment = { vertical: 'middle', horizontal: col <= 3 ? 'left' : 'center' };
+                if (isEven) cell.fill = xlsxFill('FFFAFBFC');
+                if (c.kind === 'fare') { cell.numFmt = '#,##0" บ."'; cell.font = { color: { argb: 'FF0F766E' } }; }
+                if (c.kind === 'count') cell.numFmt = '#,##0';
+                if (c.kind === 'grand') { cell.numFmt = '#,##0" บ."'; cell.font = { bold: true, color: { argb: 'FF1D4ED8' } }; }
+                if (c.kind === 'perhead') { cell.font = { bold: true, color: { argb: 'FF4338CA' } }; }
+            }
+            rIdx++;
+        }
+
+        // ─── แถวรวมท้ายตาราง ───
+        const sum = (fn) => pivot.rows.reduce((s, rr) => s + fn(rr), 0);
+        const totalPerHeadRiders = sum(rr => rr.perHeadRiders);
+        const totalPerHeadFare = sum(rr => rr.perHeadFare);
+        const totalPercent = totalPerHeadRiders > 0 ? Math.round((totalPerHeadFare / totalPerHeadRiders) * 100) / 100 : 0;
+        const footerValues = [
+            'รวมทั้งหมด', '', '',
+            sum(rr => rr.inD.riders), sum(rr => rr.inD.fare),
+            sum(rr => rr.outN.riders), sum(rr => rr.outN.fare),
+            ...extraCodes.flatMap(code => [
+                sum(rr => rr.extraPerHead[code]?.riders || 0),
+                sum(rr => rr.extraPerHead[code]?.fare || 0),
+            ]),
+            sum(rr => rr.flat17.riders), sum(rr => rr.flat17.fare),
+            sum(rr => rr.night20.trips), sum(rr => rr.night20.fare),
+            sum(rr => rr.grandTotal),
+            totalPerHeadRiders, totalPerHeadFare, totalPercent,
+        ];
+        const footerRow = ws.getRow(rIdx);
+        footerRow.values = footerValues;
+        ws.mergeCells(rIdx, 1, rIdx, 3);
+        for (let col = 1; col <= cols.length; col++) {
+            const c = cols[col - 1];
+            const cell = footerRow.getCell(col);
+            cell.border = { top: { style: 'medium', color: { argb: 'FF94A3B8' } }, left: XLSX_THIN_BORDER, bottom: XLSX_THIN_BORDER, right: XLSX_THIN_BORDER };
+            cell.fill = xlsxFill('FFF1F5F9');
+            cell.font = { bold: true, color: { argb: 'FF1E293B' } };
+            cell.alignment = { vertical: 'middle', horizontal: col <= 3 ? 'left' : 'center' };
+            if (c && c.kind === 'fare') cell.numFmt = '#,##0" บ."';
+            if (c && c.kind === 'grand') cell.numFmt = '#,##0" บ."';
+            if (c && c.kind === 'count') cell.numFmt = '#,##0';
+        }
+
+        return ws;
+    }
+
+    // ─── ชีทแบบตารางเรียบง่าย (หัวตัวหนา + สีพื้น + เส้นขอบ + แถวลายสลับ) ───
+    //    ใช้กับชีท "สรุปค่ารถ(เดิม)" และ "รายละเอียด" ที่ไม่ได้มีกลุ่มคอลัมน์สีซับซ้อนแบบ pivot
+    static addSimpleSheet(workbook, sheetNameRaw, { title, subtitleLines = [], columns, rows, totalRow = null }) {
+        const sheetName = xlsxUniqueSheetName(workbook, sheetNameRaw);
+        const ws = workbook.addWorksheet(sheetName);
+
+        ws.mergeCells(1, 1, 1, columns.length);
+        ws.getCell(1, 1).value = title;
+        ws.getCell(1, 1).font = { bold: true, size: 13, color: { argb: 'FF1E293B' } };
+        let r = 2;
+        for (const line of subtitleLines) {
+            ws.getCell(r, 1).value = line;
+            ws.getCell(r, 1).font = { size: 10, color: { argb: 'FF64748B' } };
+            r++;
+        }
+        r++;
+
+        const headerRow = r;
+        const dataStart = r + 1;
+
+        ws.columns = columns.map(c => ({ width: c.width || 14 }));
+        columns.forEach((c, i) => {
+            const cell = ws.getCell(headerRow, i + 1);
+            cell.value = c.label;
+            cell.fill = xlsxFill('FFF1F5F9');
+            cell.font = { bold: true, color: { argb: 'FF334155' } };
+            cell.alignment = { vertical: 'middle', horizontal: 'center' };
+            cell.border = XLSX_BORDER_ALL;
+        });
+        ws.getRow(headerRow).height = 20;
+        ws.views = [{ state: 'frozen', ySplit: headerRow }];
+
+        let rIdx = dataStart;
+        for (const rowValues of rows) {
+            const excelRow = ws.getRow(rIdx);
+            excelRow.values = rowValues;
+            const isEven = (rIdx - dataStart) % 2 === 1;
+            columns.forEach((c, i) => {
+                const cell = excelRow.getCell(i + 1);
+                cell.border = XLSX_BORDER_ALL;
+                cell.alignment = { vertical: 'middle', horizontal: c.align || 'center' };
+                if (isEven) cell.fill = xlsxFill('FFFAFBFC');
+                if (c.currency) { cell.numFmt = '#,##0" บ."'; cell.font = { color: { argb: 'FF0F766E' } }; }
+            });
+            rIdx++;
+        }
+
+        if (totalRow) {
+            const excelRow = ws.getRow(rIdx);
+            excelRow.values = totalRow;
+            columns.forEach((c, i) => {
+                const cell = excelRow.getCell(i + 1);
+                cell.border = { top: { style: 'medium', color: { argb: 'FF94A3B8' } }, left: XLSX_THIN_BORDER, bottom: XLSX_THIN_BORDER, right: XLSX_THIN_BORDER };
+                cell.fill = xlsxFill('FFF1F5F9');
+                cell.font = { bold: true, color: { argb: 'FF1E293B' } };
+                cell.alignment = { vertical: 'middle', horizontal: c.align || 'center' };
+                if (c.currency) cell.numFmt = '#,##0" บ."';
+            });
+        }
+
+        return ws;
+    }
+
+    static async exportExcel(startDate, endDate) {
+        const report = await this.getReport(startDate, endDate);
+        const employeeDetails = await this.getReportEmployeeDetails(startDate, endDate);
+
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'GA Dashboard';
+        wb.created = new Date();
+
+        // ─── ชีท(s) ตารางหลัก: รถ x รอบ แบบละเอียด (สีตามหน้าเว็บ) ───
+        //    ถ้าเลือกมากกว่า 1 วัน: ชีทแรก = สรุปรวมทั้งช่วง แล้วตามด้วยชีทแยกรายวัน (1 วัน/ชีท)
+        //    ถ้าเลือกวันเดียว: มีชีทเดียวพอ (สรุป = วันนั้นอยู่แล้ว ไม่ต้องซ้ำ)
+        const dates = report.dates || [];
+        if (dates.length > 1) {
+            const summaryPivot = this.buildVehiclePivot(report.trips);
+            this.addPivotSheet(
+                wb, summaryPivot, 'สรุปทั้งหมด',
+                '🚐 สรุปรวมค่ารถ (ทุกวันที่เลือก)',
+                [`ช่วงวันที่: ${startDate} ถึง ${endDate}`]
+            );
+
+            for (const d of dates) {
+                const dayTrips = report.trips.filter(t => {
+                    let td = t.operationDate;
+                    if (td instanceof Date) td = `${td.getFullYear()}-${String(td.getMonth() + 1).padStart(2, '0')}-${String(td.getDate()).padStart(2, '0')}`;
+                    else td = String(td).slice(0, 10);
+                    return td === d;
+                });
+                const dayPivot = this.buildVehiclePivot(dayTrips);
+                this.addPivotSheet(wb, dayPivot, d, `🚐 ค่ารถวันที่ ${d}`, [`วันที่: ${d}`]);
+            }
+        } else {
+            const pivot = this.buildVehiclePivot(report.trips);
+            const label = dates[0] || `${startDate} - ${endDate}`;
+            this.addPivotSheet(wb, pivot, 'รายงาน', `🚐 ค่ารถวันที่ ${label}`, [`วันที่: ${label}`]);
+        }
+
+        // ─── ชีท: สรุปค่ารถ (รายแถวต่อ รถ+รอบ) ───
+        this.addSimpleSheet(wb, 'สรุปค่ารถ(เดิม)', {
+            title: '🚐 สรุปค่ารถ',
+            subtitleLines: [`ช่วงวันที่: ${startDate} - ${endDate}`],
+            columns: [
+                { label: 'เบอร์รถ', width: 10 },
+                { label: 'รอบ', width: 14 },
+                { label: 'ทะเบียน', width: 13 },
+                { label: 'คนขับ', width: 18, align: 'left' },
+                { label: 'เที่ยว', width: 9 },
+                { label: 'พนักงาน', width: 10 },
+                { label: 'ค่ารถ', width: 14, currency: true },
+            ],
+            rows: report.vehicleSummary.map(v => [
+                v.displayNumber, v.shiftName || v.shiftCode, v.plate, v.driver, v.totalTrips, v.totalRiders, v.totalFare
+            ]),
+            totalRow: ['รวม', '', '', '', '', '', report.grandTotal],
+        });
+
+        // ─── ชีท: รายละเอียดพนักงานรายคน ───
+        this.addSimpleSheet(wb, 'รายละเอียด', {
+            title: '📋 รายละเอียดพนักงานรายคน',
+            subtitleLines: [`ช่วงวันที่: ${startDate} - ${endDate}`],
+            columns: [
+                { label: 'วันที่', width: 12 },
+                { label: 'เวลาสแกน', width: 10 },
+                { label: 'รอบ', width: 14 },
+                { label: 'รหัสบัตร', width: 12 },
+                { label: 'ชื่อ', width: 14, align: 'left' },
+                { label: 'นามสกุล', width: 16, align: 'left' },
+                { label: 'แผนก', width: 14, align: 'left' },
+                { label: 'เบอร์รถ', width: 10 },
+                { label: 'ทะเบียน', width: 13 },
+                { label: 'คนขับ', width: 18, align: 'left' },
+                { label: 'ค่ารถ', width: 12, currency: true },
+                { label: 'หมายเหตุ', width: 12 },
+            ],
+            rows: employeeDetails.map(d => [
+                d.operationDate, d.scanTime, d.shiftName || d.shiftCode, d.cardId,
+                d.firstName, d.lastName, d.department, d.displayNumber, d.plate, d.driver, d.fare, d.note
+            ]),
+        });
+
+        return await wb.xlsx.writeBuffer();
+    }
+
+    // ─── สร้างชีท "รายชื่อพนักงานที่นั่งรถแต่ละคัน" สไตล์ Pivot Table ───
+    //    (ตามหน้าตาไฟล์ตัวอย่างที่โรงงานใช้อยู่: รถ(เบอร์+คนขับ) -> รอบ (D/N/...) -> รายชื่อพนักงานทีละคน
+    //    แต่ละแถวกลุ่ม (รถ / รอบ) โชว์ยอดรวม "จำนวนคน" + "ค่ารถ" กำกับไว้เหมือนต้นฉบับ)
+    static addEmployeeListByVehicleSheet(workbook, employeeDetails, sheetNameRaw, title, subtitleLines = []) {
+        const shiftPriority = (code) => (code === 'D' ? 0 : code === 'N' ? 1 : 2);
+
+        // จัดกลุ่ม: เบอร์รถ+คนขับ -> รอบ -> [พนักงาน]
+        const vehicleMap = new Map();
+        for (const d of employeeDetails) {
+            const vKey = `${d.displayNumber ?? ''}||${d.driver ?? ''}`;
+            if (!vehicleMap.has(vKey)) {
+                vehicleMap.set(vKey, {
+                    displayNumber: d.displayNumber,
+                    driver: d.driver,
+                    plate: d.plate,
+                    totalRiders: 0,
+                    totalFare: 0,
+                    shifts: new Map(),
+                });
+            }
+            const v = vehicleMap.get(vKey);
+            v.totalRiders += 1;
+            v.totalFare += d.fare || 0;
+
+            const sKey = d.shiftCode || d.shiftName || '-';
+            if (!v.shifts.has(sKey)) {
+                v.shifts.set(sKey, {
+                    shiftCode: d.shiftCode,
+                    shiftName: d.shiftName || d.shiftCode || '-',
+                    riders: 0,
+                    fare: 0,
+                    employees: [],
+                });
+            }
+            const s = v.shifts.get(sKey);
+            s.riders += 1;
+            s.fare += d.fare || 0;
+            s.employees.push(d);
+        }
+
+        // เรียงรถตามเบอร์รถ (เหมือนตารางอื่นๆ ในระบบ)
+        const vehicles = Array.from(vehicleMap.values()).sort((a, b) =>
+            String(a.displayNumber ?? '').localeCompare(String(b.displayNumber ?? ''), 'th', { numeric: true })
+        );
+
+        const sheetName = xlsxUniqueSheetName(workbook, sheetNameRaw);
+        const ws = workbook.addWorksheet(sheetName);
+        ws.columns = [{ width: 34 }, { width: 16 }, { width: 20 }];
+
+        ws.mergeCells(1, 1, 1, 3);
+        ws.getCell(1, 1).value = title;
+        ws.getCell(1, 1).font = { bold: true, size: 13, color: { argb: 'FF1E293B' } };
+        let r = 2;
+        for (const line of subtitleLines) {
+            ws.getCell(r, 1).value = line;
+            ws.getCell(r, 1).font = { size: 10, color: { argb: 'FF64748B' } };
+            r++;
+        }
+        r++; // แถวว่างคั่น
+
+        // หัวตาราง (หน้าตาแบบ Pivot Table เดิม: "Row Labels" / "Values" แล้วตามด้วยชื่อคอลัมน์จริง)
+        ws.getCell(r, 1).value = 'Row Labels';
+        ws.getCell(r, 1).font = { bold: true, color: { argb: 'FF334155' } };
+        r++;
+        ws.getCell(r, 1).value = null;
+        ws.getCell(r, 2).value = 'Sum of Qty จำนวนคน';
+        ws.getCell(r, 3).value = 'Sum of ค่ารถ (จำนวนเงิน)';
+        [1, 2, 3].forEach(c => {
+            const cell = ws.getCell(r, c);
+            cell.font = { bold: true, color: { argb: 'FF334155' } };
+            cell.fill = xlsxFill('FFF1F5F9');
+            cell.alignment = { horizontal: c === 1 ? 'left' : 'center' };
+            cell.border = XLSX_BORDER_ALL;
+        });
+        r++;
+        ws.views = [{ state: 'frozen', ySplit: r - 1 }];
+
+        let grandRiders = 0, grandFare = 0;
+        for (const v of vehicles) {
+            // ── แถวรถ (ระดับบนสุด) ──
+            const vLabel = `${v.displayNumber ?? ''} ${v.driver ?? ''}`.trim() || '-';
+            ws.getCell(r, 1).value = vLabel;
+            ws.getCell(r, 2).value = v.totalRiders;
+            ws.getCell(r, 3).value = v.totalFare;
+            [1, 2, 3].forEach(c => {
+                const cell = ws.getCell(r, c);
+                cell.font = { bold: true, color: { argb: 'FF1E293B' } };
+                cell.fill = xlsxFill('FFE2E8F0');
+                cell.border = XLSX_BORDER_ALL;
+                cell.alignment = { horizontal: c === 1 ? 'left' : 'center' };
+            });
+            ws.getCell(r, 3).numFmt = '#,##0" บ."';
+            r++;
+            grandRiders += v.totalRiders;
+            grandFare += v.totalFare;
+
+            // เรียงรอบ D ก่อน, N รองลงมา, ที่เหลือเรียงตามชื่อ
+            const shifts = Array.from(v.shifts.values()).sort((a, b) => {
+                const p = shiftPriority(a.shiftCode) - shiftPriority(b.shiftCode);
+                if (p !== 0) return p;
+                return String(a.shiftName).localeCompare(String(b.shiftName));
+            });
+
+            for (const s of shifts) {
+                // ── แถวรอบ (ระดับกลาง) ──
+                ws.getCell(r, 1).value = s.shiftName;
+                ws.getCell(r, 2).value = s.riders;
+                ws.getCell(r, 3).value = s.fare;
+                [1, 2, 3].forEach(c => {
+                    const cell = ws.getCell(r, c);
+                    cell.font = { bold: true, color: { argb: 'FF334155' } };
+                    cell.fill = xlsxFill('FFF8FAFC');
+                    cell.border = XLSX_BORDER_ALL;
+                    cell.alignment = { horizontal: c === 1 ? 'left' : 'center', indent: c === 1 ? 1 : 0 };
+                });
+                ws.getCell(r, 3).numFmt = '#,##0" บ."';
+                r++;
+
+                // เรียงชื่อพนักงาน ก-ฮ ให้หาง่าย เหมือนไฟล์ตัวอย่าง
+                const emps = [...s.employees].sort((a, b) =>
+                    `${a.firstName}${a.lastName}`.localeCompare(`${b.firstName}${b.lastName}`, 'th')
+                );
+                for (const e of emps) {
+                    const name = `${e.firstName || ''} ${e.lastName || ''}`.trim() || e.cardId || '-';
+                    ws.getCell(r, 1).value = name;
+                    ws.getCell(r, 2).value = 1;
+                    ws.getCell(r, 3).value = e.fare || 0;
+                    [1, 2, 3].forEach(c => {
+                        const cell = ws.getCell(r, c);
+                        cell.border = XLSX_BORDER_ALL;
+                        cell.alignment = { horizontal: c === 1 ? 'left' : 'center', indent: c === 1 ? 2 : 0 };
+                    });
+                    ws.getCell(r, 3).numFmt = '#,##0" บ."';
+                    ws.getCell(r, 3).font = { color: { argb: 'FF0F766E' } };
+                    r++;
+                }
+            }
+        }
+
+        // ── แถวรวมทั้งหมด ──
+        if (vehicles.length > 0) {
+            ws.getCell(r, 1).value = 'รวมทั้งหมด';
+            ws.getCell(r, 2).value = grandRiders;
+            ws.getCell(r, 3).value = grandFare;
+            [1, 2, 3].forEach(c => {
+                const cell = ws.getCell(r, c);
+                cell.font = { bold: true, color: { argb: 'FF1D4ED8' } };
+                cell.fill = xlsxFill('FFF1F5F9');
+                cell.border = { top: { style: 'medium', color: { argb: 'FF94A3B8' } }, left: XLSX_THIN_BORDER, bottom: XLSX_THIN_BORDER, right: XLSX_THIN_BORDER };
+                cell.alignment = { horizontal: c === 1 ? 'left' : 'center' };
+            });
+            ws.getCell(r, 3).numFmt = '#,##0" บ."';
+        } else {
+            ws.getCell(r, 1).value = 'ไม่มีข้อมูล';
+            ws.getCell(r, 1).font = { color: { argb: 'FF94A3B8' } };
+        }
+
+        return ws;
+    }
+
+    // ✅ Export Excel: รายชื่อพนักงานที่นั่งรถแต่ละคัน (ปุ่มแยกต่างหากในหน้ารายงาน)
+    //    รูปแบบตามไฟล์ Pivot Table ที่โรงงานใช้อยู่เดิม (รถ -> รอบ -> รายชื่อทีละคน)
+    //    แยกชีทต่อวัน ถ้าเลือกช่วงมากกว่า 1 วัน (ชีทแรกเป็นสรุปรวม), ถ้าวันเดียวมีชีทเดียวพอ
+    static async exportEmployeeListByVehicle(startDate, endDate) {
+        const employeeDetails = await this.getReportEmployeeDetails(startDate, endDate);
+
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'GA Dashboard';
+        wb.created = new Date();
+
+        const dateSet = new Set(employeeDetails.map(d => d.operationDate));
+        const dates = Array.from(dateSet).sort();
+
+        if (dates.length > 1) {
+            this.addEmployeeListByVehicleSheet(
+                wb, employeeDetails, 'สรุปทั้งหมด',
+                '👥 รายชื่อพนักงานที่นั่งรถแต่ละคัน (สรุปรวมทุกวันที่เลือก)',
+                [`ช่วงวันที่: ${startDate} ถึง ${endDate}`]
+            );
+            for (const d of dates) {
+                const dayDetails = employeeDetails.filter(x => x.operationDate === d);
+                this.addEmployeeListByVehicleSheet(
+                    wb, dayDetails, `ค่ารถวันที่ ${d}`,
+                    `👥 รายชื่อพนักงานที่นั่งรถแต่ละคัน — วันที่ ${d}`,
+                    [`วันที่: ${d}`]
+                );
+            }
+        } else {
+            const label = dates[0] || `${startDate} - ${endDate}`;
+            this.addEmployeeListByVehicleSheet(
+                wb, employeeDetails, `ค่ารถวันที่ ${label}`,
+                `👥 รายชื่อพนักงานที่นั่งรถแต่ละคัน — วันที่ ${label}`,
+                [`วันที่: ${label}`]
+            );
+        }
+
+        return await wb.xlsx.writeBuffer();
+    }
+
+    // ✅ Export Excel: เช็คชื่อ มา/ไม่มา รายคัน (ให้คนขับถือเช็คกับตัวจริง)
+    //    ชีทแรก = พนักงานที่มีข้อมูลสแกนในช่วงที่เลือก แต่ยังไม่ถูกจัดรถ/ราคา (PayrollUnassignedRiders)
+    //    ชีทถัดไป = 1 ชีทต่อ 1 คัน ตาราง: ซ้ายสุด=ชื่อพนักงาน, บนสุด=วันที่ทุกวันในช่วง,
+    //    ช่อง = ✓ ถ้าพนักงานคนนั้นอยู่ใน vehicleTripEmployees ของคันนี้วันนั้น ไม่งั้น ✗
+    //    ท้ายแถว = สรุปมา/ขาดต่อคน, ท้ายตาราง = รวมคนมาต่อวัน
+    static async exportAttendanceChecklistByVehicle(startDate, endDate) {
+        const employeeDetails = await this.getReportEmployeeDetails(startDate, endDate);
+        const dateRange = buildDateRange(startDate, endDate);
+
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'GA Dashboard';
+        wb.created = new Date();
+
+        // ── ชีทแรก: คนที่มีข้อมูล (สแกนเข้าระบบ) ในช่วงนี้ แต่ยังไม่มีรถ/ราคา ──
+        const pendingResult = await executeQuery(`
+            SELECT ur.operationDate, ur.cardId, ur.nameSnapshot, ur.reason,
+                   e.name AS employeeName, e.department,
+                   st.shiftName
+            FROM PayrollUnassignedRiders ur
+            LEFT JOIN Employees e ON ur.employeeId = e.id
+            LEFT JOIN PayrollShiftTypes st ON ur.shiftTypeId = st.id
+            WHERE ur.operationDate BETWEEN @startDate AND @endDate
+              AND ur.status = 'pending'
+            ORDER BY ur.operationDate, e.name
+        `, { startDate, endDate });
+
+        const reasonLabel = (reason) => ({
+            no_driver_scan: 'ยังไม่มีคนขับสแกนเข้ารอบนี้',
+            vehicle_full: 'รถเต็ม (เกินที่นั่ง)',
+            no_vehicle: 'ไม่พบรถที่ตรงกับที่แจ้ง',
+            no_vehicle_trip: 'ยังไม่มีเที่ยวรถของรอบนี้',
+        }[reason] || reason || '-');
+
+        this.addSimpleSheet(wb, 'ยังไม่มีรถ-ราคา', {
+            title: '⏳ พนักงานที่มีข้อมูลในช่วงนี้ แต่ยังไม่มีรถ/ราคา',
+            subtitleLines: [
+                `ช่วงวันที่: ${startDate} ถึง ${endDate}`,
+                'รายชื่อเหล่านี้สแกนเข้าระบบแล้ว แต่ยังไม่ถูกจัดลงรถ/คิดราคา — ไม่ได้อยู่ในตารางเช็คชื่อรายคันด้านหลัง',
+            ],
+            columns: [
+                { label: 'วันที่', width: 12 },
+                { label: 'ชื่อ-สกุล', width: 26, align: 'left' },
+                { label: 'รหัสบัตร', width: 14 },
+                { label: 'แผนก', width: 16 },
+                { label: 'รอบ', width: 14 },
+                { label: 'สาเหตุ', width: 28, align: 'left' },
+            ],
+            rows: pendingResult.recordset.map(p => {
+                let d = p.operationDate;
+                if (d instanceof Date) d = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+                else d = String(d).slice(0, 10);
+                return [d, p.employeeName || p.nameSnapshot || '-', p.cardId || '-', p.department || '-', p.shiftName || '-', reasonLabel(p.reason)];
+            }),
+        });
+
+        // ── จัดกลุ่มพนักงาน (ที่มีรถแล้ว) ตามเบอร์รถ -> รอบ (เข้าเช้า/ออกกะ/อื่นๆ) -> พนักงาน ──
+        //    รวมมาจาก "รายชื่อพนักงานที่นั่งรถแต่ละคัน" เดิม (โชว์ราคา) + ตารางเช็คชื่อ (โชว์ ✓/✗ ต่อวัน)
+        //    ให้เป็นชีทเดียวกัน แยกเป็นกลุ่มตามรอบ เพราะคนขึ้นรถรอบเช้ากับรอบเย็นอาจเป็นคนละกลุ่ม/ราคาคนละแบบ
+        const vehicleMap = new Map();
+        for (const d of employeeDetails) {
+            const vKey = d.displayNumber ?? '-';
+            if (!vehicleMap.has(vKey)) {
+                vehicleMap.set(vKey, {
+                    displayNumber: d.displayNumber,
+                    plate: d.plate,
+                    drivers: new Set(),
+                    shifts: new Map(), // shiftKey -> { shiftCode, shiftName, employees: Map }
+                });
+            }
+            const v = vehicleMap.get(vKey);
+            if (d.driver) v.drivers.add(d.driver);
+
+            const shiftKey = d.shiftCode || d.shiftName || '-';
+            if (!v.shifts.has(shiftKey)) {
+                v.shifts.set(shiftKey, {
+                    shiftCode: d.shiftCode,
+                    shiftName: d.shiftName || d.shiftCode || '-',
+                    employees: new Map(), // empKey -> { name, cardId, datesPresent: Set, fareByDate: Map }
+                });
+            }
+            const shiftGroup = v.shifts.get(shiftKey);
+
+            const empKey = (d.cardId || `${d.firstName}${d.lastName}`).trim() || `${d.firstName}${d.lastName}`;
+            if (!shiftGroup.employees.has(empKey)) {
+                shiftGroup.employees.set(empKey, {
+                    name: `${d.firstName || ''} ${d.lastName || ''}`.trim() || d.cardId || '-',
+                    cardId: d.cardId || '-',
+                    datesPresent: new Set(),
+                    fareByDate: new Map(),
+                    scanTimeByDate: new Map(), // ✅ เพิ่ม: เวลาที่สแกนหน้าของวันนั้นๆ (ใช้แสดงในตารางเช็คชื่อแทน ✓)
+                });
+            }
+            const emp = shiftGroup.employees.get(empKey);
+            emp.datesPresent.add(d.operationDate);
+            emp.fareByDate.set(d.operationDate, d.fare || 0);
+            emp.scanTimeByDate.set(d.operationDate, d.scanTime || '');
+        }
+
+        const vehicles = Array.from(vehicleMap.values()).sort((a, b) =>
+            String(a.displayNumber ?? '').localeCompare(String(b.displayNumber ?? ''), 'th', { numeric: true })
+        );
+
+        for (const v of vehicles) {
+            this.addAttendanceChecklistSheet(wb, v, dateRange, startDate, endDate);
+        }
+
+        return await wb.xlsx.writeBuffer();
+    }
+
+    // ─── ชีทเช็คชื่อ+ราคา ของรถ 1 คัน — จัดกลุ่มตามรอบ (เข้าเช้า D / ออกกะ N / อื่นๆ) ───
+    //    ซ้ายสุด = ชื่อพนักงาน, บนสุด = วันที่ทุกวันในช่วง, ช่อง = ✓/✗
+    //    ท้ายแถว = มา/ขาด(วัน) + รวมค่ารถ(บาท) ของคนนั้น, แถวหัวรอบ = สรุปคน/ราคารวมของรอบนั้น
+    static addAttendanceChecklistSheet(workbook, vehicleData, dateRange, startDate, endDate) {
+        const { displayNumber, plate, drivers, shifts } = vehicleData;
+        const sheetName = xlsxUniqueSheetName(workbook, `เบอร์ ${displayNumber ?? '-'}`);
+        const ws = workbook.addWorksheet(sheetName);
+
+        const presentCol = 3 + dateRange.length;
+        const absentCol = presentCol + 1;
+        const fareCol = absentCol + 1;
+        const totalCols = fareCol;
+
+        ws.columns = [
+            { width: 26 },
+            { width: 12 },
+            ...dateRange.map(() => ({ width: 5 })),
+            { width: 9 },
+            { width: 9 },
+            { width: 14 },
+        ];
+
+        ws.mergeCells(1, 1, 1, totalCols);
+        ws.getCell(1, 1).value = `🚐 เช็คชื่อ + ราคารถ รายวัน — เบอร์ ${displayNumber ?? '-'}${plate ? ' (' + plate + ')' : ''}`;
+        ws.getCell(1, 1).font = { bold: true, size: 13, color: { argb: 'FF1E293B' } };
+
+        ws.mergeCells(2, 1, 2, totalCols);
+        ws.getCell(2, 1).value = `คนขับ: ${Array.from(drivers).join(', ') || '-'}  •  ช่วงวันที่: ${startDate} ถึง ${endDate}  •  ช่องวันที่ = เวลาสแกนหน้า (ว่าง/✗ = ไม่มีข้อมูลว่ามา) • แถว "ราคา(บาท)" ใต้แต่ละรอบ = ราคารวมของรอบนั้นในวันนั้น`;
+        ws.getCell(2, 1).font = { size: 10, color: { argb: 'FF64748B' } };
+
+        const headerRow = 4;
+        ws.getCell(headerRow, 1).value = 'ชื่อ-สกุล';
+        ws.getCell(headerRow, 2).value = 'รหัสบัตร';
+        dateRange.forEach((d, i) => { ws.getCell(headerRow, 3 + i).value = d.slice(8, 10); });
+        ws.getCell(headerRow, presentCol).value = 'มา(วัน)';
+        ws.getCell(headerRow, absentCol).value = 'ขาด(วัน)';
+        ws.getCell(headerRow, fareCol).value = 'รวมค่ารถ(บาท)';
+        for (let c = 1; c <= totalCols; c++) {
+            const cell = ws.getCell(headerRow, c);
+            cell.font = { bold: true, color: { argb: 'FF334155' } };
+            cell.fill = xlsxFill('FFF1F5F9');
+            cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
+            cell.border = XLSX_BORDER_ALL;
+        }
+        ws.getRow(headerRow).height = 20;
+        ws.views = [{ state: 'frozen', xSplit: 2, ySplit: headerRow }];
+
+        // เรียงรอบ: D (เข้าเช้า) ก่อน, N (ออกกะ) รองลงมา, ที่เหลือเรียงตามชื่อ
+        const shiftPriority = (code) => (code === 'D' ? 0 : code === 'N' ? 1 : 2);
+        const shiftGroups = Array.from(shifts.values()).sort((a, b) => {
+            const p = shiftPriority(a.shiftCode) - shiftPriority(b.shiftCode);
+            if (p !== 0) return p;
+            return String(a.shiftName).localeCompare(String(b.shiftName));
+        });
+
+        let r = headerRow + 1;
+        const vehicleDayTotals = new Array(dateRange.length).fill(0);
+        const vehicleDayFareTotals = new Array(dateRange.length).fill(0);
+        let grandRiderRows = 0, grandFare = 0;
+
+        for (const shiftGroup of shiftGroups) {
+            const empList = Array.from(shiftGroup.employees.values()).sort((a, b) => a.name.localeCompare(b.name, 'th'));
+            const shiftDayTotals = new Array(dateRange.length).fill(0);
+            const shiftDayFareTotals = new Array(dateRange.length).fill(0); // ✅ ราคารวมของรอบนี้ แยกต่อวัน
+            let shiftFare = 0;
+            for (const emp of empList) {
+                dateRange.forEach((d, i) => {
+                    if (emp.datesPresent.has(d)) {
+                        shiftDayTotals[i]++;
+                        const fareOnDate = emp.fareByDate.get(d) || 0;
+                        shiftDayFareTotals[i] += fareOnDate;
+                    }
+                });
+                for (const f of emp.fareByDate.values()) shiftFare += f;
+            }
+
+            // ── แถวหัวรอบ (เช้า/ออกกะ/อื่นๆ) — จำนวนคนต่อวัน + สรุปรวมทั้งช่วง ──
+            const shiftColor = shiftGroup.shiftCode === 'D' ? 'FFEFF6FF' : shiftGroup.shiftCode === 'N' ? 'FFF0FDF4' : 'FFFEFCE8';
+            ws.getCell(r, 1).value = `${shiftGroup.shiftName} (คน)`;
+            dateRange.forEach((d, i) => { ws.getCell(r, 3 + i).value = shiftDayTotals[i] || ''; });
+            ws.getCell(r, presentCol).value = empList.length;
+            ws.getCell(r, fareCol).value = shiftFare;
+            for (let c = 1; c <= totalCols; c++) {
+                const cell = ws.getCell(r, c);
+                cell.font = { bold: true, color: { argb: 'FF1E293B' } };
+                cell.fill = xlsxFill(shiftColor);
+                cell.border = XLSX_BORDER_ALL;
+                cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
+            }
+            ws.getCell(r, fareCol).numFmt = '#,##0" บ."';
+            r++;
+
+            // ── แถว "ราคา(บาท)" ของรอบนี้ แยกต่อวัน — เช่น วันที่ 16 เช้า 300 บ. ──
+            //    (รอบ 20:00/perTrip ไม่มีราคาต่อคนโดยตรง แต่ยังโชว์ยอดรวมของรอบ/วันนั้นได้ตามปกติ)
+            ws.getCell(r, 1).value = `${shiftGroup.shiftName} (ราคา บ.)`;
+            dateRange.forEach((d, i) => {
+                const cell = ws.getCell(r, 3 + i);
+                if (shiftDayTotals[i] > 0) {
+                    cell.value = shiftDayFareTotals[i];
+                    cell.numFmt = '#,##0';
+                }
+            });
+            ws.getCell(r, presentCol).value = '';
+            ws.getCell(r, fareCol).value = shiftFare;
+            for (let c = 1; c <= totalCols; c++) {
+                const cell = ws.getCell(r, c);
+                cell.font = { italic: true, color: { argb: 'FF0F766E' } };
+                cell.fill = xlsxFill(shiftColor);
+                cell.border = XLSX_BORDER_ALL;
+                cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
+            }
+            ws.getCell(r, fareCol).numFmt = '#,##0" บ."';
+            r++;
+
+            for (const emp of empList) {
+                let presentCount = 0;
+                let empFare = 0;
+                ws.getCell(r, 1).value = emp.name;
+                ws.getCell(r, 1).alignment = { horizontal: 'left', vertical: 'middle', indent: 1 };
+                ws.getCell(r, 2).value = emp.cardId;
+                dateRange.forEach((d, i) => {
+                    const present = emp.datesPresent.has(d);
+                    const cell = ws.getCell(r, 3 + i);
+                    // ✅ ดึงเวลาที่สแกนหน้ามาแสดงแทน ✓ เฉยๆ — ถ้ามาแต่ไม่มีเวลาสแกน (เช่น เพิ่มมือ) ให้โชว์ ✓ แทน
+                    const scanTime = emp.scanTimeByDate ? emp.scanTimeByDate.get(d) : '';
+                    cell.value = present ? (scanTime || '✓') : '✗';
+                    cell.font = { bold: true, color: { argb: present ? 'FF15803D' : 'FFB91C1C' } };
+                    cell.fill = xlsxFill(present ? 'FFDCFCE7' : 'FFFEE2E2');
+                    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+                    cell.border = XLSX_BORDER_ALL;
+                    if (present) {
+                        presentCount++;
+                        const fareOnDate = emp.fareByDate.get(d) || 0;
+                        empFare += fareOnDate;
+                        vehicleDayTotals[i]++;
+                        vehicleDayFareTotals[i] += fareOnDate;
+                    }
+                });
+                ws.getCell(r, presentCol).value = presentCount;
+                ws.getCell(r, absentCol).value = dateRange.length - presentCount;
+                ws.getCell(r, fareCol).value = empFare;
+                [1, 2, presentCol, absentCol, fareCol].forEach(c => {
+                    const cell = ws.getCell(r, c);
+                    cell.border = XLSX_BORDER_ALL;
+                    if (c !== 1) cell.alignment = { horizontal: 'center', vertical: 'middle' };
+                });
+                ws.getCell(r, presentCol).font = { bold: true, color: { argb: 'FF15803D' } };
+                ws.getCell(r, absentCol).font = { bold: true, color: { argb: 'FFB91C1C' } };
+                ws.getCell(r, fareCol).font = { color: { argb: 'FF0F766E' } };
+                ws.getCell(r, fareCol).numFmt = '#,##0" บ."';
+                r++;
+
+                grandRiderRows++;
+                grandFare += empFare;
+            }
+        }
+
+        // ── แถวรวมท้ายตาราง: จำนวนคนมาต่อวัน (รวมทุกรอบ) ──
+        if (grandRiderRows > 0) {
+            ws.getCell(r, 1).value = 'รวมคนมาทั้งคัน (คน/วัน)';
+            dateRange.forEach((d, i) => { ws.getCell(r, 3 + i).value = vehicleDayTotals[i]; });
+            ws.getCell(r, presentCol).value = '';
+            ws.getCell(r, absentCol).value = '';
+            ws.getCell(r, fareCol).value = grandFare;
+            for (let c = 1; c <= totalCols; c++) {
+                const cell = ws.getCell(r, c);
+                cell.font = { bold: true, color: { argb: 'FF1D4ED8' } };
+                cell.fill = xlsxFill('FFF1F5F9');
+                cell.border = { top: { style: 'medium', color: { argb: 'FF94A3B8' } }, left: XLSX_THIN_BORDER, bottom: XLSX_THIN_BORDER, right: XLSX_THIN_BORDER };
+                cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
+            }
+            ws.getCell(r, fareCol).numFmt = '#,##0" บ."';
+            r++;
+
+            // ── แถวรวมราคาทั้งคันต่อวัน (ทุกรอบรวมกัน) ──
+            ws.getCell(r, 1).value = 'รวมค่ารถทั้งคัน (บาท/วัน)';
+            dateRange.forEach((d, i) => {
+                const cell = ws.getCell(r, 3 + i);
+                if (vehicleDayFareTotals[i] > 0) {
+                    cell.value = vehicleDayFareTotals[i];
+                    cell.numFmt = '#,##0';
+                }
+            });
+            ws.getCell(r, presentCol).value = '';
+            ws.getCell(r, absentCol).value = '';
+            ws.getCell(r, fareCol).value = grandFare;
+            for (let c = 1; c <= totalCols; c++) {
+                const cell = ws.getCell(r, c);
+                cell.font = { bold: true, italic: true, color: { argb: 'FF1D4ED8' } };
+                cell.fill = xlsxFill('FFF1F5F9');
+                cell.border = { left: XLSX_THIN_BORDER, bottom: { style: 'medium', color: { argb: 'FF94A3B8' } }, right: XLSX_THIN_BORDER };
+                cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
+            }
+            ws.getCell(r, fareCol).numFmt = '#,##0" บ."';
+        } else {
+            ws.getCell(r, 1).value = 'ไม่มีข้อมูล';
+            ws.getCell(r, 1).font = { color: { argb: 'FF94A3B8' } };
+        }
+
+        return ws;
+    }
+
+    // ✅ Export Excel: "รายชื่อพนักงานที่นั่งรถแต่ละคัน" — เอากลับมาตามที่ขอ
+    //    ต่างจาก exportAttendanceChecklistByVehicle (ตาราง ✓/✗ ไล่ตามวันที่) ตรงที่รายงานนี้
+    //    เป็นรายการดิบ 1 แถวต่อ 1 คน/1 วัน/1 รอบ (เหมือนชีท "รายละเอียด" ใน exportExcel) แต่แยก
+    //    เป็น 1 ชีทต่อ 1 คัน อ่านง่ายเวลาจะดูว่าคันไหนมีใครนั่งบ้างในแต่ละวัน พร้อมเวลาสแกนหน้า + ราคา
+    static async exportRidersByVehicle(startDate, endDate) {
+        const employeeDetails = await this.getReportEmployeeDetails(startDate, endDate);
+
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'GA Dashboard';
+        wb.created = new Date();
+
+        // ── จัดกลุ่มตามเบอร์รถ ──
+        const vehicleMap = new Map();
+        for (const d of employeeDetails) {
+            const vKey = d.displayNumber ?? '-';
+            if (!vehicleMap.has(vKey)) {
+                vehicleMap.set(vKey, {
+                    displayNumber: d.displayNumber,
+                    plate: d.plate,
+                    drivers: new Set(),
+                    rows: [],
+                });
+            }
+            const v = vehicleMap.get(vKey);
+            if (d.driver) v.drivers.add(d.driver);
+            v.rows.push(d);
+        }
+
+        const vehicles = Array.from(vehicleMap.values()).sort((a, b) =>
+            String(a.displayNumber ?? '').localeCompare(String(b.displayNumber ?? ''), 'th', { numeric: true })
+        );
+
+        if (vehicles.length === 0) {
+            this.addSimpleSheet(wb, 'ไม่มีข้อมูล', {
+                title: '🧑‍🤝‍🧑 รายชื่อพนักงานที่นั่งรถแต่ละคัน',
+                subtitleLines: [`ช่วงวันที่: ${startDate} ถึง ${endDate}`, 'ไม่พบข้อมูลในช่วงวันที่ที่เลือก'],
+                columns: [{ label: '-', width: 20 }],
+                rows: [],
+            });
+            return await wb.xlsx.writeBuffer();
+        }
+
+        for (const v of vehicles) {
+            // เรียงตามวันที่ → รอบ → ชื่อ ให้อ่านง่าย
+            const rows = v.rows.slice().sort((a, b) =>
+                String(a.operationDate).localeCompare(String(b.operationDate)) ||
+                String(a.shiftCode || '').localeCompare(String(b.shiftCode || '')) ||
+                String(a.firstName || '').localeCompare(String(b.firstName || ''), 'th')
+            );
+            const totalFare = rows.reduce((s, r) => s + (r.fare || 0), 0);
+
+            this.addSimpleSheet(wb, `เบอร์ ${v.displayNumber ?? '-'}`, {
+                title: `🧑‍🤝‍🧑 รายชื่อพนักงานที่นั่งรถ — เบอร์ ${v.displayNumber ?? '-'}${v.plate ? ' (' + v.plate + ')' : ''}`,
+                subtitleLines: [
+                    `คนขับ: ${Array.from(v.drivers).join(', ') || '-'}`,
+                    `ช่วงวันที่: ${startDate} ถึง ${endDate}  •  ทั้งหมด ${rows.length} รายการ (นับซ้ำได้ถ้าคนเดิมนั่งหลายวัน/หลายรอบ)`,
+                ],
+                columns: [
+                    { label: 'วันที่', width: 12 },
+                    { label: 'รอบ', width: 14 },
+                    { label: 'เวลาสแกน', width: 10 },
+                    { label: 'รหัสบัตร', width: 12 },
+                    { label: 'ชื่อ', width: 14, align: 'left' },
+                    { label: 'นามสกุล', width: 16, align: 'left' },
+                    { label: 'แผนก', width: 14, align: 'left' },
+                    { label: 'ค่ารถ', width: 12, currency: true },
+                    { label: 'หมายเหตุ', width: 12 },
+                ],
+                rows: rows.map(d => [
+                    d.operationDate, d.shiftName || d.shiftCode, d.scanTime || '-',
+                    d.cardId, d.firstName, d.lastName, d.department, d.fare || 0, d.note
+                ]),
+                totalRow: ['รวมทั้งหมด', '', '', '', '', '', '', totalFare, ''],
+            });
+        }
+
+        return await wb.xlsx.writeBuffer();
+    }
+
+    // ✅ Export Excel เฉพาะรถคันเดียว — ใช้ตอนกดดูรายละเอียดรถแล้วอยากได้ไฟล์แยกของคันนั้น
+    //    ใช้ตารางคอลัมน์แบบเดียวกับ exportExcel (IN D / OUT N / 17:00 / 20:00) แต่กรองเหลือรถคันเดียว
+    //    และแยกชีทรายวันเหมือนกันถ้าเลือกมากกว่า 1 วัน
+    static async exportVehicleExcel(vehicleId, startDate, endDate) {
+        const report = await this.getReport(startDate, endDate);
+        const vId = Number(vehicleId);
+        const vehicle = report.vehicles.find(v => v.vehicleId === vId);
+        const vehicleTrips = report.trips
+            .filter(t => t.vehicleId === vId)
+            .sort((a, b) => String(a.operationDate).localeCompare(String(b.operationDate)) || String(a.shiftCode).localeCompare(String(b.shiftCode)));
+
+        const displayNumber = vehicle?.displayNumber ?? vehicleId;
+        const plate = vehicle?.plate ?? '-';
+        const driver = vehicle?.driver ?? '-';
+
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'GA Dashboard';
+        wb.created = new Date();
+
+        const dates = Array.from(new Set(vehicleTrips.map(t => {
+            let d = t.operationDate;
+            if (d instanceof Date) d = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            else d = String(d).slice(0, 10);
+            return d;
+        }))).sort();
+
+        if (dates.length > 1) {
+            const summaryPivot = this.buildVehiclePivot(vehicleTrips);
+            this.addPivotSheet(
+                wb, summaryPivot, 'สรุปทั้งหมด',
+                `🚐 สรุปค่ารถ — เบอร์ ${displayNumber} (${plate})`,
+                [`คนขับหลัก: ${driver}`, `ช่วงวันที่: ${startDate} ถึง ${endDate}`]
+            );
+
+            for (const d of dates) {
+                const dayTrips = vehicleTrips.filter(t => {
+                    let td = t.operationDate;
+                    if (td instanceof Date) td = `${td.getFullYear()}-${String(td.getMonth() + 1).padStart(2, '0')}-${String(td.getDate()).padStart(2, '0')}`;
+                    else td = String(td).slice(0, 10);
+                    return td === d;
+                });
+                const dayPivot = this.buildVehiclePivot(dayTrips);
+                this.addPivotSheet(wb, dayPivot, d, `🚐 เบอร์ ${displayNumber} วันที่ ${d}`, [`วันที่: ${d}`]);
+            }
+        } else {
+            const pivot = this.buildVehiclePivot(vehicleTrips);
+            const label = dates[0] || `${startDate} - ${endDate}`;
+            this.addPivotSheet(
+                wb, pivot, 'รายงาน',
+                `🚐 เบอร์ ${displayNumber} (${plate}) — วันที่ ${label}`,
+                [`คนขับหลัก: ${driver}`, `วันที่: ${label}`]
+            );
+        }
+
+        // ─── ชีทท้าย: รายละเอียดรายเที่ยว (ดิบ) ของคันนี้ ───
+        this.addSimpleSheet(wb, 'รายละเอียด', {
+            title: `📋 รายละเอียดการเดินรถ — เบอร์ ${displayNumber}`,
+            subtitleLines: [`ช่วงวันที่: ${startDate} - ${endDate}`],
+            columns: [
+                { label: 'วันที่', width: 12 },
+                { label: 'รอบ', width: 14 },
+                { label: 'คนขับ (บัตร)', width: 14 },
+                { label: 'ราคา/เที่ยว', width: 12, currency: true },
+                { label: 'พนักงาน', width: 10 },
+                { label: 'ค่ารวม', width: 14, currency: true },
+            ],
+            rows: vehicleTrips.map(t => [
+                t.operationDate, t.shiftName || t.shiftCode, t.driverCardId || '-',
+                t.fareUsed || 0, t.totalRiders || 0, t.totalFare || 0
+            ]),
+            totalRow: ['รวมทั้งหมด', '', '', '', '', vehicle?.totalFare || 0],
+        });
+
+        return await wb.xlsx.writeBuffer();
+    }
+
+
+    static async getImports() {
+        const result = await executeQuery(`
+            SELECT * FROM PayrollScanImports 
+            ORDER BY importDate DESC
+        `);
+        return result.recordset;
+    }
+
+    static async getImportDetail(importId) {
+        const result = await executeQuery(`
+            SELECT * FROM PayrollScanRows WHERE importId = @importId
+            ORDER BY rowIndex
+        `, { importId });
+        return result.recordset;
+    }
+
+    static async approveDay(date, userId) {
+        const result = await executeQuery(`
+            UPDATE PayrollOperationDays SET
+                status = 'approved',
+                approvedBy = @userId,
+                approvedAt = GETDATE(),
+                updatedAt = GETDATE()
+            WHERE operationDate = @date AND status != 'locked'
+        `, { date, userId });
+
+        if (result.rowsAffected[0] === 0) {
+            throw new Error('ไม่สามารถอนุมัติได้ (อาจถูกล็อกแล้ว)');
+        }
+
+        return { date, status: 'approved', approvedBy: userId };
+    }
+
+    static async lockDay(date, userId) {
+        const result = await executeQuery(`
+            UPDATE PayrollOperationDays SET
+                status = 'locked',
+                lockedBy = @userId,
+                lockedAt = GETDATE(),
+                updatedAt = GETDATE()
+            WHERE operationDate = @date AND status IN ('approved', 'completed')
+        `, { date, userId });
+
+        if (result.rowsAffected[0] === 0) {
+            throw new Error('ไม่สามารถล็อกได้ (ต้องมีสถานะ approved หรือ completed)');
+        }
+
+        await executeQuery(`
+            UPDATE PayrollVehicleTrips SET
+                status = 'locked',
+                updatedAt = GETDATE()
+            WHERE operationDate = @date AND status NOT IN ('locked', 'paid')
+        `, { date });
+
+        return { date, status: 'locked', lockedBy: userId };
+    }
+
+    // ─── AUDIT LOG ───
+    static async logAudit(tableName, recordId, fieldName, newValue, action, userId) {
+        const validActions = ['INSERT', 'UPDATE', 'DELETE', 'STATUS_CHANGE'];
+        if (!validActions.includes(action)) {
+            action = 'UPDATE';
+        }
+
+        await executeQuery(`
+            INSERT INTO PayrollAuditLogs (
+                tableName, recordId, fieldName, newValue, action, userId
+            ) VALUES (
+                @tableName, @recordId, @fieldName, @newValue, @action, @userId
+            )
+        `, {
+            tableName,
+            recordId: typeof recordId === 'string' ? 0 : parseInt(recordId) || 0,
+            fieldName: fieldName || '',
+            newValue: String(newValue || ''),
+            action,
+            userId: userId || 'system'
+        });
+    }
+
+    static async getAuditLog(tableName, recordId, limit) {
+        let query = `SELECT * FROM PayrollAuditLogs WHERE 1=1`;
+        const params = {};
+        
+        if (tableName) {
+            query += ' AND tableName = @tableName';
+            params.tableName = tableName;
+        }
+        if (recordId) {
+            query += ' AND recordId = @recordId';
+            params.recordId = parseInt(recordId);
+        }
+        
+        query += ` ORDER BY createdAt DESC`;
+        if (limit) {
+            query += ` OFFSET 0 ROWS FETCH NEXT @limit ROWS ONLY`;
+            params.limit = parseInt(limit);
+        }
+
+        const result = await executeQuery(query, params);
+        return result.recordset;
+    }
+
+    static async addVehicleTrip(data) {
+        const { operationDate, shiftTypeId, vehicleId, driverCardId, note, createdBy } = data;
+
+        await this.getOrCreateOperationDay(operationDate);
+
+        const shiftType = await executeQuery(`
+            SELECT * FROM PayrollShiftTypes WHERE id = @shiftTypeId
+        `, { shiftTypeId });
+
+        if (shiftType.recordset.length === 0) {
+            throw new Error('ไม่พบ Shift Type');
+        }
+
+        // ⚠️ แก้บั๊ก: ฟังก์ชันนี้ไม่เคยเช็คมาก่อนว่ารถคันนี้มีเที่ยวอยู่แล้ว
+        //    ในวันที่/รอบเดียวกันหรือไม่ ทำให้ถ้ากด "เพิ่มรถเข้ารอบ" ซ้ำ
+        //    (หรือรถถูกสร้างไปแล้วจากการนำเข้าไฟล์สแกน) จะเกิดเที่ยวรถซ้ำ
+        //    2 ใบสำหรับรถคันเดียวกัน — การ์ดรถในหน้าเว็บเลยโชว์ซ้ำกัน
+        //    ตอนนี้เช็คก่อนด้วย tripExists เหมือนฝั่ง import ทุกจุด
+        if (await this.tripExists(operationDate, shiftTypeId, vehicleId)) {
+            throw new Error('รถคันนี้ถูกเพิ่มเข้ารอบนี้ในวันนี้ไปแล้ว (มีเที่ยวอยู่แล้ว) ไม่สามารถเพิ่มซ้ำได้');
+        }
+
+        const rate = await executeQuery(`
+            SELECT TOP 1 rate FROM PayrollRateSettings 
+            WHERE shiftCode = @shiftCode AND isActive = 1
+            ORDER BY effectiveFrom DESC
+        `, { shiftCode: shiftType.recordset[0].shiftCode });
+
+        const fareUsed = rate.recordset[0]?.rate || 0;
+        const fareType = shiftType.recordset[0].fareType;
+
+        // ✅ แก้บั๊ก: เดิม totalFare ถูก hardcode เป็น 0 เสมอ ไม่ว่า fareType
+        //    จะเป็นอะไร ทำให้รอบ flatByVehicle/perTrip (ราคาคงที่ต่อคัน/ต่อเที่ยว
+        //    ไม่ได้สะสมจากค่ารถรายคน) เพิ่มรถเข้ารอบเองแล้วราคาไม่ขึ้นเลย
+        //    ตอนนี้ถ้าเป็นราคาคงที่ ให้ตั้ง totalFare = fareUsed ทันทีตอนสร้าง
+        //    ส่วน perHead ยังคงเป็น 0 เหมือนเดิม เพราะต้องรอสะสมจากพนักงาน
+        //    ที่ถูกเพิ่มเข้ามาทีหลัง (ผ่าน updateTripTotals)
+        const initialTotalFare = (fareType === 'flatByVehicle' || fareType === 'perTrip') ? fareUsed : 0;
+
+        const result = await executeQuery(`
+            INSERT INTO PayrollVehicleTrips (
+                operationDate, shiftTypeId, vehicleId, driverCardId,
+                fareType, fareUsed, totalFare, status, note, createdBy
+            ) OUTPUT INSERTED.id
+            VALUES (
+                @operationDate, @shiftTypeId, @vehicleId, @driverCardId,
+                @fareType, @fareUsed, @initialTotalFare, 'draft', @note, @createdBy
+            )
+        `, {
+            operationDate,
+            shiftTypeId,
+            vehicleId,
+            driverCardId: driverCardId || null,
+            fareType,
+            fareUsed,
+            initialTotalFare,
+            note: note || '',
+            createdBy: createdBy || 'system'
+        });
+
+        const tripId = result.recordset[0].id;
+        await this.updateDaySummary(operationDate);
+
+        return { id: tripId, operationDate, shiftTypeId, vehicleId };
+    }
+
+    // ─── REMOVE VEHICLE TRIP ───
+    static async removeVehicleTrip(id, userId) {
+        const trip = await executeQuery(`
+            SELECT * FROM PayrollVehicleTrips WHERE id = @id AND status != 'locked'
+        `, { id });
+
+        if (trip.recordset.length === 0) {
+            throw new Error('ไม่พบข้อมูล VehicleTrip หรือถูกล็อกแล้ว');
+        }
+
+        // The database status constraint has no "deleted" value. Remove the
+        // dependent riders first, then remove the trip itself so it vanishes
+        // from Daily without changing it to the unrelated "locked" status.
+        await executeQuery(`
+            DELETE FROM PayrollTripEmployees WHERE vehicleTripId = @id
+        `, { id });
+        await executeQuery(`DELETE FROM PayrollVehicleTrips WHERE id = @id`, { id });
+
+        await this.logAudit('PayrollVehicleTrips', id, 'status', 'removed', 'DELETE', userId);
+
+        const tripData = trip.recordset[0];
+        await this.updateDaySummary(tripData.operationDate);
+
+        return { id, message: 'ลบรถสำเร็จ' };
+    }
+
+    // ─── CREATE PAYROLL PERIOD ───
+    static async createPayrollPeriod(data) {
+        const { startDate, endDate, label, createdBy } = data;
+
+        const check = await executeQuery(`
+            SELECT id FROM PayrollPeriod 
+            WHERE (startDate <= @endDate AND endDate >= @startDate)
+            AND isDeleted = 0
+        `, { startDate, endDate });
+
+        if (check.recordset.length > 0) {
+            throw new Error('มีช่วงวันที่ซ้อนทับกับงวดจ่ายเงินที่มีอยู่แล้ว');
+        }
+
+        const result = await executeQuery(`
+            INSERT INTO PayrollPeriod (startDate, endDate, label, status, createdAt)
+            OUTPUT INSERTED.id
+            VALUES (@startDate, @endDate, @label, 'open', GETDATE())
+        `, { startDate, endDate, label });
+
+        const id = result.recordset[0].id;
+
+        await executeQuery(`
+            UPDATE PayrollOperationDays SET status = 'locked'
+            WHERE operationDate BETWEEN @startDate AND @endDate
+            AND status NOT IN ('locked', 'paid')
+        `, { startDate, endDate });
+
+        await this.logAudit('PayrollPeriod', id, 'create', label, 'INSERT', createdBy || 'system');
+
+        return { id, startDate, endDate, label, status: 'open' };
+    }
+
+    // ─── UPDATE ASSIGNMENT ───
+    static async updateAssignment(id, data) {
+        const { vehicleId, shiftTypeId, fare, totalRiders, note, driverCardId, tripCount, userId, manualOverride } = data;
+
+        const trip = await executeQuery(`
+            SELECT * FROM PayrollVehicleTrips WHERE id = @id AND status != 'locked'
+        `, { id });
+
+        if (trip.recordset.length === 0) {
+            throw new Error('ไม่พบข้อมูล VehicleTrip หรือถูกล็อกแล้ว');
+        }
+        const tripData = trip.recordset[0];
+
+        const updates = [];
+        const params = { id };
+
+        // ✅ แก้บั๊ก: เดิม modal "แก้ไขเที่ยวรถ" ไม่มีช่องจำนวนเที่ยว (tripSeq) เลย
+        //    กรณีคนขับลืมสแกน แล้วแอดมินต้องปรับย้อนหลังจาก 1 เที่ยว → 2 เที่ยว
+        //    ทำได้แค่พิมพ์ค่ารถ (fareUsed) เองตรงๆ แต่คอลัมน์ tripSeq ในฐานข้อมูล
+        //    ไม่เคยถูกอัปเดตตาม (รายงานสรุปที่นับเที่ยวจาก tripSeq เพี้ยน) และราคา
+        //    ก็ไม่ได้ดึงจากตาราง PayrollVehicleRates ที่ตั้งไว้ต่อคัน (500/550 บ.)
+        //    ให้อัตโนมัติ ตอนนี้ถ้าส่ง tripCount มา จะอัปเดต tripSeq เสมอ และถ้า
+        //    ไม่ได้ส่ง fare มาด้วย (ไม่ได้ตั้งใจพิมพ์ราคาเอง) กับเที่ยวที่เป็น
+        //    fareType = 'perTrip' จะดึงราคาจาก PayrollVehicleRates ตาม
+        //    (vehicleId, tripCount) มาเติมให้อัตโนมัติ — ยังพิมพ์ราคาเองทับได้ตามปกติ
+        //    ถ้าส่ง fare มาด้วยพร้อมกัน
+        let resolvedFare = fare;
+        if (tripCount !== undefined) {
+            updates.push('tripSeq = @tripCount');
+            params.tripCount = tripCount;
+
+            if (resolvedFare === undefined && tripData.fareType === 'perTrip') {
+                const targetVehicleId = vehicleId !== undefined ? vehicleId : tripData.vehicleId;
+                const autoRate = await this.getVehicleNightRate(targetVehicleId, tripCount);
+                if (autoRate !== null) {
+                    resolvedFare = autoRate;
+                } else {
+                    console.warn(`⚠️ updateAssignment: ไม่พบราคาที่ตั้งไว้สำหรับรถ vehicleId=${targetVehicleId} (${tripCount} เที่ยว) — ค่ารถเดิมจะไม่ถูกเปลี่ยน กรุณาตั้งราคาใน "จัดการอัตรารถ" ก่อน`);
+                }
+            }
+        }
+
+        if (vehicleId !== undefined) { 
+            updates.push('vehicleId = @vehicleId'); 
+            params.vehicleId = vehicleId; 
+        }
+        if (shiftTypeId !== undefined) { 
+            updates.push('shiftTypeId = @shiftTypeId'); 
+            params.shiftTypeId = shiftTypeId; 
+        }
+        if (resolvedFare !== undefined) { 
+            updates.push('fareUsed = @fare'); 
+            params.fare = resolvedFare; 
+        }
+        if (totalRiders !== undefined) { 
+            updates.push('totalRiders = @totalRiders'); 
+            params.totalRiders = totalRiders; 
+        }
+        // ✅ เพิ่ม "ปรับยอดเอง" (isManualOverride) — กรณีรอบรายหัว (perHead) ที่รายชื่อ
+        //    พนักงานในระบบไม่ครบ (เช่น พนักงานทำงานเสร็จแล้วออกโดยไม่ได้แตะบัตรสแกน)
+        //    เดิมต่อให้พิมพ์ "ค่ารถ"/"จำนวนพนักงาน" เองในหน้าแก้ไข ค่าที่กรอกก็ไม่มีผล
+        //    เพราะรอบ perHead จะถูกคำนวณทับจาก SUM(fare)/COUNT(*) ของ PayrollTripEmployees
+        //    เสมอ (ดู updateTripTotals ด้านล่าง) ตอนนี้ถ้าแอดมินติ๊ก "ปรับยอดเอง" ในหน้า
+        //    แก้ไขเที่ยวรถ ระบบจะยึดค่า fare/totalRiders ที่กรอกเป็นตัวจริง ไม่คำนวณทับ
+        //    จากรายชื่อพนักงานอีก แม้จะมีการเพิ่ม/ลบชื่อภายหลังก็ตาม จนกว่าจะติ๊กออก
+        if (manualOverride === true) {
+            updates.push('isManualOverride = 1');
+        } else if (manualOverride === false) {
+            updates.push('isManualOverride = 0');
+        }
+        if (note !== undefined) { 
+            updates.push('note = @note'); 
+            params.note = note; 
+        }
+        // ✅ เพิ่มรองรับเปลี่ยนคนขับ (driverCardId) — เดิมไม่มีเลย
+        //    ทำให้ปุ่ม "เปลี่ยนคนขับ" ที่ตกลงกันไว้ทำงานจริงไม่ได้
+        if (driverCardId !== undefined) {
+            updates.push('driverCardId = @driverCardId');
+            params.driverCardId = driverCardId || null;
+        }
+        updates.push('updatedAt = GETDATE()');
+
+        if (updates.length > 1) {
+            await executeQuery(`
+                UPDATE PayrollVehicleTrips SET ${updates.join(', ')}
+                WHERE id = @id
+            `, params);
+
+            // ✅ แก้บั๊ก: เดิมคำนวณ totalFare = fareUsed * totalRiders สำหรับรอบ
+            //    ที่ไม่ใช่ flatByVehicle/perTrip (เช่น perHead) — แต่รอบ perHead
+            //    ไม่เคยเก็บราคาไว้ที่ fareUsed เลย (fareUsed ถูกตั้งเป็น 0 เสมอ
+            //    ตอนสร้างเที่ยวรถ เพราะราคาคิดที่รายคนใน PayrollTripEmployees.fare
+            //    แทน) ผลคือทุกครั้งที่กด "แก้ไขข้อมูล" แล้วบันทึก (ต่อให้ไม่ได้
+            //    ตั้งใจแก้ค่ารถเลย) totalFare จะถูกทับเป็น fareUsed(=0) × totalRiders
+            //    = 0 ทันที ทั้งที่พนักงานแต่ละคนมีค่ารถของตัวเองอยู่ครบ
+            //    ตอนนี้แยกตรรกะตาม fareType: รอบราคาคงที่ (flatByVehicle/perTrip)
+            //    ใช้ fareUsed ตรงๆ ตามเดิม ส่วนรอบ perHead (หรือรอบอื่นที่คิดรายหัว)
+            //    ให้รวมยอดจาก SUM(fare) ของพนักงานจริงในเที่ยวรถนั้นแทน เหมือนที่
+            //    updateTripTotals() ใช้ ไม่พึ่ง fareUsed ซึ่งไม่เคยถูกตั้งค่าจริง
+            // ✅ ถ้าติ๊ก "ปรับยอดเอง" (isManualOverride = 1) ให้ยึด fareUsed/totalRiders
+            //    ที่เพิ่งบันทึกไปเป็นตัวจริงตรงๆ ไม่คำนวณทับจากรายชื่อพนักงานอีก
+            //    ไม่ว่าจะเป็นรอบราคาคงที่หรือรายหัวก็ตาม
+            await executeQuery(`
+                UPDATE vt SET
+                    vt.totalFare = CASE
+                        WHEN vt.isManualOverride = 1 THEN vt.fareUsed
+                        WHEN vt.fareType IN ('flatByVehicle', 'perTrip') THEN vt.fareUsed
+                        ELSE ISNULL((
+                            SELECT SUM(te.fare) FROM PayrollTripEmployees te
+                            WHERE te.vehicleTripId = vt.id
+                        ), 0)
+                    END
+                FROM PayrollVehicleTrips vt
+                WHERE vt.id = @id
+            `, { id });
+        }
+
+        // ✅ ถ้าเพิ่งติ๊ก "ปรับยอดเอง" ออก (กลับไปคำนวณอัตโนมัติ) ให้คำนวณยอดใหม่
+        //    จากรายชื่อพนักงานจริงในเที่ยวรถทันที แทนที่จะค้างค่าที่เคยพิมพ์เองไว้
+        if (manualOverride === false) {
+            await this.updateTripTotals(id);
+        }
+
+        await this.logAudit('PayrollVehicleTrips', id, 'assignment', 'updated', 'UPDATE', userId || 'system');
+
+        await this.updateDaySummary(tripData.operationDate);
+
+        return { id, message: 'อัปเดตสำเร็จ' };
+    }
+
+    // ✅ ลบพนักงานคนเดียวออกจากเที่ยวรถ แล้วคำนวณ totalRiders/totalFare ใหม่
+    static async removeTripEmployee(tripEmployeeId, userId) {
+        const row = await executeQuery(`
+            SELECT te.*, vt.status AS tripStatus
+            FROM PayrollTripEmployees te
+            INNER JOIN PayrollVehicleTrips vt ON te.vehicleTripId = vt.id
+            WHERE te.id = @id
+        `, { id: tripEmployeeId });
+
+        if (row.recordset.length === 0) {
+            throw new Error('ไม่พบพนักงานในเที่ยวรถนี้');
+        }
+        const record = row.recordset[0];
+        if (record.tripStatus === 'locked') {
+            throw new Error('เที่ยวรถนี้ถูกล็อกแล้ว แก้ไขไม่ได้');
+        }
+
+        await executeQuery(`DELETE FROM PayrollTripEmployees WHERE id = @id`, { id: tripEmployeeId });
+        await this.updateTripTotals(record.vehicleTripId);
+        await this.logAudit('PayrollTripEmployees', tripEmployeeId, 'employee', record.cardId, 'DELETE', userId || 'system');
+
+        return { id: tripEmployeeId, vehicleTripId: record.vehicleTripId, message: 'ลบพนักงานออกจากเที่ยวรถสำเร็จ' };
+    }
+
+    static async updateTripTotals(tripId) {
+        const result = await executeQuery(`
+            SELECT 
+                COUNT(*) as totalRiders,
+                ISNULL(SUM(fare), 0) as totalFare
+            FROM PayrollTripEmployees
+            WHERE vehicleTripId = @tripId
+        `, { tripId });
+
+        const data = result.recordset[0] || { totalRiders: 0, totalFare: 0 };
+
+        // ✅ แก้บั๊ก: ของเดิมคำนวณ totalFare = SUM(fare รายคน) เสมอ ไม่สนใจ
+        //    fareType ของเที่ยวรถ แต่รอบ flatByVehicle/perTrip (ราคาคงที่ต่อคัน/
+        //    ต่อเที่ยว) บันทึก fare รายคนเป็น 0 เสมอโดยตั้งใจ (ดู
+        //    processFlatByVehicleShift) เพราะราคาคิดที่รถ ไม่ใช่รายหัว —
+        //    ผลคือทุกครั้งที่มีการเพิ่ม/ลบพนักงานออกจากรถ (ผ่าน addEmployeeToTrip,
+        //    removeTripEmployee, resolveUnassignedRider) ฟังก์ชันนี้จะรีเซ็ต
+        //    totalFare ของรอบราคาคงที่กลับเป็น 0 ทับราคาที่ถูกต้องอยู่แล้ว
+        //    ตอนนี้เช็ค fareType ก่อน ถ้าเป็นราคาคงที่ ให้อัปเดตแค่ totalRiders
+        //    และคงค่า totalFare (= fareUsed) เดิมไว้ ไม่คำนวณจาก SUM(fare) ทับ
+        const tripResult = await executeQuery(`
+            SELECT fareType, fareUsed, isManualOverride FROM PayrollVehicleTrips WHERE id = @tripId
+        `, { tripId });
+        const trip = tripResult.recordset[0];
+
+        // ✅ ถ้าแอดมินติ๊ก "ปรับยอดเอง" ไว้ (isManualOverride) ห้ามคำนวณทับ แม้จะมี
+        //    การเพิ่ม/ลบชื่อพนักงานในเที่ยวรถนี้ภายหลังก็ตาม (เช่น ระบบจับคู่สแกน
+        //    เพิ่มชื่อเข้ามาทีหลัง) เพราะยอด ค่ารถ/จำนวนคน ที่ถูกต้องจริงถูกกำหนด
+        //    ไว้เองแล้ว ไม่ได้อ้างอิงจากรายชื่อที่สแกนได้ครบหรือไม่ครบ
+        if (trip && trip.isManualOverride) {
+            return;
+        }
+
+        const isFixedPrice = trip && (trip.fareType === 'flatByVehicle' || trip.fareType === 'perTrip');
+
+        if (isFixedPrice) {
+            await executeQuery(`
+                UPDATE PayrollVehicleTrips SET
+                    totalRiders = @totalRiders,
+                    updatedAt = GETDATE()
+                WHERE id = @tripId
+            `, {
+                tripId,
+                totalRiders: data.totalRiders || 0
+            });
+            return;
+        }
+
+        await executeQuery(`
+            UPDATE PayrollVehicleTrips SET
+                totalRiders = @totalRiders,
+                totalFare = @totalFare,
+                updatedAt = GETDATE()
+            WHERE id = @tripId
+        `, {
+            tripId,
+            totalRiders: data.totalRiders || 0,
+            totalFare: data.totalFare || 0
+        });
+    }
+    // ─── เพิ่มพนักงานจากทะเบียนโดยตรงเข้าเที่ยวรถ ───
+    static async addEmployeeToTrip(vehicleTripId, employeeId, userId = 'system') {
+        const tripResult = await executeQuery(`
+            SELECT id, status FROM PayrollVehicleTrips WHERE id = @vehicleTripId
+        `, { vehicleTripId });
+        const trip = tripResult.recordset[0];
+        if (!trip) throw new Error('ไม่พบเที่ยวรถ');
+        if (trip.status === 'locked') throw new Error('เที่ยวรถนี้ถูกล็อกแล้ว');
+
+        const employeeResult = await executeQuery(`
+            SELECT id, cardId, name, department, section, address, fare
+            FROM Employees WHERE id = @employeeId
+        `, { employeeId });
+        const employee = employeeResult.recordset[0];
+        if (!employee) throw new Error('ไม่พบพนักงาน');
+        if (!employee.cardId || !employee.name) throw new Error('ข้อมูลพนักงานไม่สมบูรณ์');
+
+        const duplicateResult = await executeQuery(`
+            SELECT COUNT(*) AS cnt FROM PayrollTripEmployees
+            WHERE vehicleTripId = @vehicleTripId AND cardId = @cardId
+        `, { vehicleTripId, cardId: employee.cardId });
+        if (duplicateResult.recordset[0]?.cnt > 0) throw new Error('พนักงานคนนี้อยู่ในรถคันนี้แล้ว');
+
+        const inserted = await executeQuery(`
+            INSERT INTO PayrollTripEmployees (
+                vehicleTripId, employeeId, cardId, nameSnapshot,
+                department, section, destination, fare, isDriver
+            )
+            OUTPUT INSERTED.*
+            VALUES (
+                @vehicleTripId, @employeeId, @cardId, @name,
+                @department, @section, @destination, @fare, 0
+            )
+        `, {
+            vehicleTripId,
+            employeeId: employee.id,
+            cardId: employee.cardId,
+            name: employee.name,
+            department: employee.department || '',
+            section: employee.section || '',
+            destination: employee.address || '',
+            fare: employee.fare || 0
+        });
+
+        await this.updateTripTotals(vehicleTripId);
+        await this.logAudit('PayrollTripEmployees', inserted.recordset[0].id, 'employee', employee.cardId, 'INSERT', userId);
+        return inserted.recordset[0];
+    }
+
+    // ─── RESOLVE UNASSIGNED RIDER (เพิ่มพนักงานที่ค้างอยู่ใน PayrollUnassignedRiders เข้ารถที่เลือก) ───
+    // ⚠️ เพิ่มใหม่: daily.js เรียก PUT /unassigned-riders/:id/resolve อยู่แล้ว
+    //    (ตอนกด "+ เพิ่มพนักงาน" แล้วเลือกคนจากลิสต์ที่ยังไม่มีรถ) แต่ route
+    //    นี้ไม่เคยถูกสร้างขึ้นฝั่ง backend เลย ทำให้ได้ 404 ทุกครั้ง
+    static async resolveUnassignedRider(unassignedId, vehicleId, userId = 'system') {
+        // 1. ดึงแถว PayrollUnassignedRiders ที่จะ resolve
+        const urResult = await executeQuery(`
+            SELECT * FROM PayrollUnassignedRiders WHERE id = @id AND status = 'pending'
+        `, { id: unassignedId });
+        const ur = urResult.recordset[0];
+        if (!ur) {
+            throw new Error('ไม่พบรายการนี้ หรือถูกจัดการไปแล้ว');
+        }
+
+        // 2. หา VehicleTrip ปลายทาง (วันเดียวกัน รอบเดียวกัน รถที่เลือก)
+        const tripResult = await executeQuery(`
+            SELECT * FROM PayrollVehicleTrips
+            WHERE operationDate = @date AND shiftTypeId = @shiftTypeId
+              AND vehicleId = @vehicleId AND status != 'deleted'
+        `, { date: ur.operationDate, shiftTypeId: ur.shiftTypeId, vehicleId });
+        const trip = tripResult.recordset[0];
+        if (!trip) {
+            throw new Error('รถคันนี้ยังไม่มีเที่ยวในรอบนี้ของวันดังกล่าว กรุณาเพิ่มรถเข้ารอบก่อน');
+        }
+
+        // 3. ดึงข้อมูลพนักงานปัจจุบัน (เอา department/section/destination สดๆ)
+        let emp = {};
+        if (ur.employeeId) {
+            const empResult = await executeQuery(`SELECT * FROM Employees WHERE id = @id`, { id: ur.employeeId });
+            emp = empResult.recordset[0] || {};
+        }
+
+        // 4. กันเพิ่มซ้ำ ถ้าคนนี้อยู่ในเที่ยวนี้แล้ว
+        const dupCheck = await executeQuery(`
+            SELECT COUNT(*) as cnt FROM PayrollTripEmployees
+            WHERE vehicleTripId = @tripId AND cardId = @cardId
+        `, { tripId: trip.id, cardId: ur.cardId });
+        if (dupCheck.recordset[0]?.cnt > 0) {
+            throw new Error('พนักงานคนนี้อยู่ในรถคันนี้แล้ว');
+        }
+
+        // 5. เพิ่มเข้า PayrollTripEmployees
+        await executeQuery(`
+            INSERT INTO PayrollTripEmployees (
+                vehicleTripId, employeeId, cardId, nameSnapshot,
+                department, section, destination, fare, isDriver
+            ) VALUES (
+                @tripId, @employeeId, @cardId, @name,
+                @department, @section, @destination, @fare, 0
+            )
+        `, {
+            tripId: trip.id,
+            employeeId: ur.employeeId || null,
+            cardId: ur.cardId,
+            name: ur.nameSnapshot || emp.name || '',
+            department: emp.department || '',
+            section: emp.section || '',
+            destination: emp.address || '',
+            fare: ur.fare || 0
+        });
+
+        // 6. ปิดรายการใน PayrollUnassignedRiders
+        await executeQuery(`
+            UPDATE PayrollUnassignedRiders SET
+                status = 'resolved', expectedVehicleId = @vehicleId, updatedAt = GETDATE()
+            WHERE id = @id
+        `, { id: unassignedId, vehicleId });
+
+        // 7. อัปเดตยอดรวมของเที่ยวรถ
+        await this.updateTripTotals(trip.id);
+
+        return { tripId: trip.id, vehicleId };
+    }
+}
+
+module.exports = PayrollEngine;
