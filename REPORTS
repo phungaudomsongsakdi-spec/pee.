@@ -1,0 +1,518 @@
+// ============================================================
+//  REPORTS — รายงาน + Export (ตารางรถ x รอบ พร้อมกดดูรายละเอียด)
+// ============================================================
+
+import PayrollData from './data.js';
+import { getTodayStr, formatDateThai, formatCurrency, formatBaht } from './utils.js';
+
+function ensureReportStyles() {
+    if (document.getElementById('reportsStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'reportsStyles';
+    style.textContent = `
+        .rpt-table-card{background:var(--surface);border-radius:12px;padding:0;border:1px solid var(--border);overflow:hidden;}
+        .rpt-table-head{padding:16px 18px 12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+        .rpt-table-head h4{font-size:15px;font-weight:700;margin:0;display:flex;align-items:center;gap:8px;}
+        .rpt-legend{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:6px;cursor:help;}
+        .rpt-scroll{overflow:auto;max-height:560px;border-top:1px solid var(--border);}
+        table.rpt-table{border-collapse:separate;border-spacing:0;width:100%;font-size:12.5px;white-space:nowrap;}
+        table.rpt-table thead th{position:sticky;background:#f8fafc;font-weight:700;color:#334155;border-bottom:1px solid var(--border);padding:8px 10px;text-align:center;}
+        table.rpt-table thead tr:first-child th{top:0;z-index:3;font-size:11.5px;letter-spacing:.02em;color:#64748b;border-left:1px solid #eef1f5;}
+        table.rpt-table thead tr:nth-child(2) th{top:var(--rpt-row2-top,29px);z-index:2;font-size:11.5px;border-left:1px solid #eef1f5;}
+        table.rpt-table thead tr:first-child th:first-child,
+        table.rpt-table thead tr:first-child th.rpt-id-col{border-left:none;}
+        table.rpt-table thead th.rpt-grp-d{background:#eff6ff;}
+        table.rpt-table thead th.rpt-grp-n{background:#f0fdf4;}
+        table.rpt-table thead th.rpt-grp-extra{background:#fefce8;}
+        table.rpt-table thead th.rpt-grp-17{background:#fff7ed;}
+        table.rpt-table thead th.rpt-grp-20{background:#fdf2f8;}
+        table.rpt-table thead th.rpt-grp-total{background:#f1f5f9;}
+        table.rpt-table thead th.rpt-grp-perhead{background:#eef2ff;}
+        table.rpt-table tbody td{padding:8px 10px;text-align:center;border-bottom:1px solid #f1f5f9;}
+        table.rpt-table tbody td.rpt-id-col{text-align:left;}
+        table.rpt-table tbody tr.rpt-row{cursor:pointer;transition:background .12s;}
+        table.rpt-table tbody tr.rpt-row:nth-child(even){background:#fafbfc;}
+        table.rpt-table tbody tr.rpt-row:hover{background:#eef4ff;}
+        table.rpt-table tbody td.rpt-fare{color:#0f766e;font-variant-numeric:tabular-nums;}
+        table.rpt-table tbody td.rpt-grand{font-weight:700;color:var(--primary);font-variant-numeric:tabular-nums;}
+        table.rpt-table tbody td.rpt-perhead{font-weight:600;color:#4338ca;font-variant-numeric:tabular-nums;}
+        table.rpt-table tbody td.rpt-muted{color:#cbd5e1;}
+        .rpt-veh-badge{display:inline-flex;align-items:center;gap:4px;background:var(--text);color:#fff;font-weight:800;padding:2px 8px;border-radius:6px;font-size:11.5px;}
+        table.rpt-table tfoot td{padding:9px 10px;text-align:center;font-weight:700;background:#f1f5f9;border-top:2px solid var(--border);position:sticky;bottom:0;}
+        table.rpt-table tfoot td.rpt-id-col{text-align:left;}
+        table.rpt-table tbody td .rpt-actions{display:flex;gap:4px;justify-content:center;}
+    `;
+    document.head.appendChild(style);
+}
+
+// ✅ แก้บั๊ก "หัวตารางแถวสี (แถวที่ 2) ขยับตอนสกอลล์ ในขณะที่แถวเทา (rowspan) นิ่ง":
+//    เดิม top ของแถวหัวที่ 2 ถูก hardcode ไว้ที่ 29px โดยสมมติว่าแถวหัวแรกสูงพอดี 29px
+//    เสมอ แต่ความสูงจริงของแถวขึ้นกับ font/บราวเซอร์ที่เรนเดอร์ ทำให้เพี้ยนไปไม่กี่พิกเซล
+//    ก็เห็นเป็นอาการ "ขยับ" ระหว่างสกอลล์ได้ (ส่วนแถวเทาที่ตั้ง top:0 ไว้ตรงๆ จึงนิ่งกว่า)
+//    แก้โดยวัดความสูงจริงของแถวหัวแรกด้วย JS แล้ว set ทับ CSS variable แทนเลขที่เดา
+function syncStickyHeaderOffset(scrollEl) {
+    if (!scrollEl) return;
+    const firstRowCell = scrollEl.querySelector(
+        'table.rpt-table thead tr:first-child th.rpt-grp-d, ' +
+        'table.rpt-table thead tr:first-child th.rpt-grp-n, ' +
+        'table.rpt-table thead tr:first-child th.rpt-grp-17, ' +
+        'table.rpt-table thead tr:first-child th.rpt-grp-20, ' +
+        'table.rpt-table thead tr:first-child th.rpt-grp-perhead'
+    );
+    if (!firstRowCell) return;
+    const h = firstRowCell.getBoundingClientRect().height;
+    if (h > 0) scrollEl.style.setProperty('--rpt-row2-top', `${h}px`);
+}
+
+const Reports = {
+    startDate: new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0],
+    endDate: getTodayStr(),
+
+    // เก็บผลลัพธ์ล่าสุดไว้ใช้ตอนเปิด modal รายละเอียดรถ (ไม่ต้องยิง API ซ้ำ)
+    _lastData: { trips: [], vehicles: [], shiftColumns: [], grandTotal: 0 },
+    _resizeHandler: null,
+
+    async render(container) {
+        if (!container) {
+            container = document.getElementById('payrollContent');
+        }
+        if (!container) return;
+
+        await PayrollData.loadAll();
+        ensureReportStyles();
+
+        const startDate = this.startDate;
+        const endDate = this.endDate;
+
+        // ─── ดึงข้อมูล ───
+        let reportData = { trips: [], vehicles: [], shiftColumns: [], grandTotal: 0 };
+        try {
+            const result = await window.PayrollAPI?.getReport(startDate, endDate);
+            reportData = result?.data || result || reportData;
+        } catch (err) {
+            console.error('Load report error:', err);
+        }
+
+        const trips = reportData.trips || [];
+        const vehicles = reportData.vehicles || [];        // ✅ 1 แถว/รถ พร้อม breakdown ตามรอบซ้อนอยู่ข้างใน
+        const shiftColumns = reportData.shiftColumns || []; // ✅ คอลัมน์รอบที่มีจริงในช่วงวันที่เลือก (D, N, ...)
+        const pivot = reportData.pivotRows || { rows: [], extraPerHeadShiftCodes: [] }; // ✅ ตารางละเอียด IN D/OUT N/17:00/20:00
+        const grandTotal = reportData.grandTotal || 0;
+        const totalTrips = trips.length;
+        const totalEmployees = vehicles.reduce((s, v) => s + (v.totalRiders || 0), 0);
+        const totalVehicles = vehicles.length;
+
+        this._lastData = { trips, vehicles, shiftColumns, pivot, grandTotal };
+
+        // ─── แสดงผล ───
+        container.innerHTML = `
+            <div style="margin-bottom:16px;">
+                <h2 style="font-size:18px;font-weight:700;margin-bottom:4px;">📊 รายงาน</h2>
+                <p style="color:var(--muted);font-size:13px;">สรุปรายงานตามช่วงวันที่ — กดที่แถวรถเพื่อดูรายละเอียดแต่ละรอบ</p>
+            </div>
+
+            <!-- FILTER -->
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:12px 16px;background:var(--bg);border-radius:8px;border:1px solid var(--border);margin-bottom:16px;">
+                <label style="font-weight:600;font-size:13px;">📅 ช่วงวันที่:</label>
+                <input type="date" id="reportStart" value="${startDate}" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px;font-size:13px;font-family:inherit;">
+                <span style="color:var(--muted);">ถึง</span>
+                <input type="date" id="reportEnd" value="${endDate}" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px;font-size:13px;font-family:inherit;">
+                <button class="btn btn-primary btn-sm" onclick="window.reportsApplyFilter()">
+                    <i class="fas fa-search"></i> ดู
+                </button>
+                <button class="btn btn-success btn-sm" onclick="window.reportsExport()">
+                    <i class="fas fa-file-excel"></i> Export Excel (ทั้งหมด)
+                </button>
+                <button class="btn btn-success btn-sm" onclick="window.reportsExportEmployeeListByVehicle()">
+                    <i class="fas fa-users"></i> Export Excel (รายชื่อพนักงานที่นั่งรถแต่ละคัน)
+                </button>
+                <button class="btn btn-success btn-sm" onclick="window.reportsExportAttendanceChecklist()">
+                    <i class="fas fa-clipboard-check"></i> Export Excel (เช็คชื่อ+ราคา มา/ไม่มา รายคัน แยกรอบ)
+                </button>
+                <button class="btn btn-success btn-sm" onclick="window.reportsExportRidersByVehicle()">
+                    <i class="fas fa-users"></i> Export Excel (รายชื่อพนักงานที่นั่งรถแต่ละคัน)
+                </button>
+            </div>
+
+            <!-- STATS -->
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
+                <div style="background:var(--surface);border-radius:8px;padding:12px;border:1px solid var(--border);text-align:center;">
+                    <div style="font-size:22px;font-weight:700;color:var(--primary);">${totalVehicles}</div>
+                    <div style="font-size:12px;color:var(--muted);">🚐 รถ</div>
+                </div>
+                <div style="background:var(--surface);border-radius:8px;padding:12px;border:1px solid var(--border);text-align:center;">
+                    <div style="font-size:22px;font-weight:700;color:var(--primary);">${totalTrips}</div>
+                    <div style="font-size:12px;color:var(--muted);">📋 เที่ยว</div>
+                </div>
+                <div style="background:var(--surface);border-radius:8px;padding:12px;border:1px solid var(--border);text-align:center;">
+                    <div style="font-size:22px;font-weight:700;color:var(--primary);">${totalEmployees}</div>
+                    <div style="font-size:12px;color:var(--muted);">👥 พนักงาน</div>
+                </div>
+                <div style="background:var(--surface);border-radius:8px;padding:12px;border:1px solid var(--border);text-align:center;">
+                    <div style="font-size:22px;font-weight:700;color:var(--primary);">${formatBaht(grandTotal)}</div>
+                    <div style="font-size:12px;color:var(--muted);">💰 ค่ารถรวม</div>
+                </div>
+            </div>
+
+            <!-- MAIN TABLE: รถ x รอบ แบบละเอียด (IN D / OUT N / 17:00 / 20:00) -->
+            <div class="rpt-table-card">
+                <div class="rpt-table-head">
+                    <h4>🚐 ตารางรถ — คลิกแถวเพื่อดูรายละเอียด</h4>
+                </div>
+                <div class="rpt-scroll" id="rptScroll">
+                    <table class="rpt-table">
+                        <thead>
+                            <tr>
+                                <th class="rpt-id-col" rowspan="2">เบอร์รถ</th>
+                                <th class="rpt-id-col" rowspan="2">ทะเบียน</th>
+                                <th class="rpt-id-col" rowspan="2">คนขับ</th>
+                                <th class="rpt-grp-d" colspan="2">🌅 เข้าเช้า (D)</th>
+                                <th class="rpt-grp-n" colspan="2">🌆 ออกกะ (N)</th>
+                                ${(pivot.extraPerHeadShiftCodes || []).map(code => `
+                                    <th class="rpt-grp-extra" colspan="2">${code}</th>
+                                `).join('')}
+                                <th class="rpt-grp-17" colspan="2">🕔 17:00</th>
+                                <th class="rpt-grp-20" colspan="2">🌙 20:00</th>
+                                <th class="rpt-grp-total" rowspan="2">รวมทั้งหมด</th>
+                                <th class="rpt-grp-perhead" colspan="3">📐 สรุปค่าหัว</th>
+                                <th class="rpt-grp-total" rowspan="2">การกระทำ</th>
+                            </tr>
+                            <tr>
+                                <th class="rpt-grp-d">คน</th>
+                                <th class="rpt-grp-d">รวม(บาท)</th>
+                                <th class="rpt-grp-n">คน</th>
+                                <th class="rpt-grp-n">รวม(บาท)</th>
+                                ${(pivot.extraPerHeadShiftCodes || []).map(() => `
+                                    <th class="rpt-grp-extra">คน</th>
+                                    <th class="rpt-grp-extra">รวม(บาท)</th>
+                                `).join('')}
+                                <th class="rpt-grp-17">คนเลิกงาน</th>
+                                <th class="rpt-grp-17">รวม(บาท)</th>
+                                <th class="rpt-grp-20">เที่ยว</th>
+                                <th class="rpt-grp-20">รวม(บาท)</th>
+                                <th class="rpt-grp-perhead">รวมคน D+N</th>
+                                <th class="rpt-grp-perhead">รวมราคา D+N</th>
+                                <th class="rpt-grp-perhead">฿/หัว</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${pivot.rows.length === 0 ? `
+                                <tr><td colspan="${16 + (pivot.extraPerHeadShiftCodes || []).length * 2}" class="empty-row">ไม่มีข้อมูล</td></tr>
+                            ` : `
+                                ${pivot.rows.map(row => `
+                                    <tr class="rpt-row" onclick="window.reportsShowVehicleDetail(${row.vehicleId})">
+                                        <td class="rpt-id-col"><span class="rpt-veh-badge">🚐 ${row.displayNumber}</span></td>
+                                        <td class="rpt-id-col">${row.plate || '-'}</td>
+                                        <td class="rpt-id-col">${row.driver || '-'}</td>
+                                        <td class="${row.inD.riders ? '' : 'rpt-muted'}">${row.inD.riders || '-'}</td>
+                                        <td class="rpt-fare">${formatBaht(row.inD.fare)}</td>
+                                        <td class="${row.outN.riders ? '' : 'rpt-muted'}">${row.outN.riders || '-'}</td>
+                                        <td class="rpt-fare">${formatBaht(row.outN.fare)}</td>
+                                        ${(pivot.extraPerHeadShiftCodes || []).map(code => `
+                                            <td class="${row.extraPerHead[code]?.riders ? '' : 'rpt-muted'}">${row.extraPerHead[code]?.riders || '-'}</td>
+                                            <td class="rpt-fare">${formatBaht(row.extraPerHead[code]?.fare || 0)}</td>
+                                        `).join('')}
+                                        <td class="${row.flat17.riders ? '' : 'rpt-muted'}">${row.flat17.riders || '-'}</td>
+                                        <td class="rpt-fare">${formatBaht(row.flat17.fare)}</td>
+                                        <td class="${row.night20.trips ? '' : 'rpt-muted'}">${row.night20.trips || '-'}</td>
+                                        <td class="rpt-fare">${formatBaht(row.night20.fare)}</td>
+                                        <td class="rpt-grand">${formatBaht(row.grandTotal)}</td>
+                                        <td>${row.perHeadRiders}</td>
+                                        <td class="rpt-fare">${formatBaht(row.perHeadFare)}</td>
+                                        <td class="rpt-perhead">${row.percentPerHead}</td>
+                                        <td onclick="event.stopPropagation()">
+                                            <div class="rpt-actions">
+                                                <button class="btn btn-sm btn-outline" title="ดูรายละเอียด" onclick="window.reportsShowVehicleDetail(${row.vehicleId})">
+                                                    <i class="fas fa-eye"></i>
+                                                </button>
+                                                <button class="btn btn-sm btn-success" title="Export เฉพาะคันนี้" onclick="window.reportsExportVehicle(${row.vehicleId})">
+                                                    <i class="fas fa-file-excel"></i>
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            `}
+                        </tbody>
+                        ${pivot.rows.length === 0 ? '' : `
+                        <tfoot>
+                            <tr>
+                                <td class="rpt-id-col" colspan="3">รวมทั้งหมด</td>
+                                <td>${pivot.rows.reduce((s, r) => s + r.inD.riders, 0)}</td>
+                                <td>${formatBaht(pivot.rows.reduce((s, r) => s + r.inD.fare, 0))}</td>
+                                <td>${pivot.rows.reduce((s, r) => s + r.outN.riders, 0)}</td>
+                                <td>${formatBaht(pivot.rows.reduce((s, r) => s + r.outN.fare, 0))}</td>
+                                ${(pivot.extraPerHeadShiftCodes || []).map(code => `
+                                    <td>${pivot.rows.reduce((s, r) => s + (r.extraPerHead[code]?.riders || 0), 0)}</td>
+                                    <td>${formatBaht(pivot.rows.reduce((s, r) => s + (r.extraPerHead[code]?.fare || 0), 0))}</td>
+                                `).join('')}
+                                <td>${pivot.rows.reduce((s, r) => s + r.flat17.riders, 0)}</td>
+                                <td>${formatBaht(pivot.rows.reduce((s, r) => s + r.flat17.fare, 0))}</td>
+                                <td>${pivot.rows.reduce((s, r) => s + r.night20.trips, 0)}</td>
+                                <td>${formatBaht(pivot.rows.reduce((s, r) => s + r.night20.fare, 0))}</td>
+                                <td style="color:var(--primary);">${formatBaht(grandTotal)}</td>
+                                <td>${pivot.rows.reduce((s, r) => s + r.perHeadRiders, 0)}</td>
+                                <td>${formatBaht(pivot.rows.reduce((s, r) => s + r.perHeadFare, 0))}</td>
+                                <td>${(() => { const totRiders = pivot.rows.reduce((s, r) => s + r.perHeadRiders, 0); const totFare = pivot.rows.reduce((s, r) => s + r.perHeadFare, 0); return totRiders > 0 ? Math.round((totFare / totRiders) * 100) / 100 : 0; })()}</td>
+                                <td></td>
+                            </tr>
+                        </tfoot>
+                        `}
+                    </table>
+                </div>
+            </div>
+        `;
+
+        // ✅ วัดความสูงจริงของหัวตารางแถวแรก แล้วซิงก์ให้แถวหัวที่ 2 (สี) เกาะ sticky
+        //    ที่ตำแหน่งเดียวกับที่แถวเทา (rowspan) เกาะพอดี ไม่ให้ขยับตอนสกอลล์
+        const scrollEl = document.getElementById('rptScroll');
+        requestAnimationFrame(() => syncStickyHeaderOffset(scrollEl));
+        if (this._resizeHandler) window.removeEventListener('resize', this._resizeHandler);
+        this._resizeHandler = () => syncStickyHeaderOffset(document.getElementById('rptScroll'));
+        window.addEventListener('resize', this._resizeHandler);
+
+        // ─── EXPOSE FUNCTIONS ───
+        window.reportsApplyFilter = () => {
+            const start = document.getElementById('reportStart').value;
+            const end = document.getElementById('reportEnd').value;
+            if (start && end) {
+                this.startDate = start;
+                this.endDate = end;
+                this.render(container);
+            }
+        };
+
+        window.reportsExport = async () => {
+            const start = document.getElementById('reportStart').value;
+            const end = document.getElementById('reportEnd').value;
+            if (!start || !end) {
+                alert('⚠️ กรุณาเลือกช่วงวันที่');
+                return;
+            }
+            try {
+                const blob = await window.PayrollAPI?.exportExcel(start, end);
+                if (blob) {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `Payroll_${start}_to_${end}.xlsx`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                }
+            } catch (err) {
+                alert('❌ ' + err.message);
+            }
+        };
+
+        // ─── Export Excel: รายชื่อพนักงานที่นั่งรถแต่ละคัน (ปุ่มแยกต่างหาก) ───
+        window.reportsExportEmployeeListByVehicle = async () => {
+            const start = document.getElementById('reportStart').value;
+            const end = document.getElementById('reportEnd').value;
+            if (!start || !end) {
+                alert('⚠️ กรุณาเลือกช่วงวันที่');
+                return;
+            }
+            try {
+                let blob = null;
+                if (window.PayrollAPI?.exportEmployeeListByVehicle) {
+                    blob = await window.PayrollAPI.exportEmployeeListByVehicle(start, end);
+                } else {
+                    // fallback: เรียก endpoint ตรงถ้ายังไม่มี wrapper ใน PayrollAPI
+                    const res = await fetch(`${window.API_BASE}/payroll/export/employee-list-by-vehicle?startDate=${start}&endDate=${end}`);
+                    if (!res.ok) throw new Error('Export ไม่สำเร็จ');
+                    blob = await res.blob();
+                }
+                if (blob) {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `RiderList_${start}_to_${end}.xlsx`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                }
+            } catch (err) {
+                alert('❌ ' + err.message);
+            }
+        };
+
+        // ─── Export Excel: เช็คชื่อ มา/ไม่มา รายคัน (ปุ่มแยกต่างหาก) ───
+        window.reportsExportAttendanceChecklist = async () => {
+            const start = document.getElementById('reportStart').value;
+            const end = document.getElementById('reportEnd').value;
+            if (!start || !end) {
+                alert('⚠️ กรุณาเลือกช่วงวันที่');
+                return;
+            }
+            try {
+                let blob = null;
+                if (window.PayrollAPI?.exportAttendanceChecklist) {
+                    blob = await window.PayrollAPI.exportAttendanceChecklist(start, end);
+                } else {
+                    // fallback: เรียก endpoint ตรงถ้ายังไม่มี wrapper ใน PayrollAPI
+                    const res = await fetch(`${window.API_BASE}/payroll/export/attendance-checklist?startDate=${start}&endDate=${end}`);
+                    if (!res.ok) throw new Error('Export ไม่สำเร็จ');
+                    blob = await res.blob();
+                }
+                if (blob) {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `AttendanceChecklist_${start}_to_${end}.xlsx`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                }
+            } catch (err) {
+                alert('❌ ' + err.message);
+            }
+        };
+
+        // ─── Export Excel: รายชื่อพนักงานที่นั่งรถแต่ละคัน (เอากลับมา) ───
+        window.reportsExportRidersByVehicle = async () => {
+            const start = document.getElementById('reportStart').value;
+            const end = document.getElementById('reportEnd').value;
+            if (!start || !end) {
+                alert('⚠️ กรุณาเลือกช่วงวันที่');
+                return;
+            }
+            try {
+                let blob = null;
+                if (window.PayrollAPI?.exportRidersByVehicle) {
+                    blob = await window.PayrollAPI.exportRidersByVehicle(start, end);
+                } else {
+                    // fallback: เรียก endpoint ตรงถ้ายังไม่มี wrapper ใน PayrollAPI
+                    const res = await fetch(`${window.API_BASE}/payroll/export/riders-by-vehicle?startDate=${start}&endDate=${end}`);
+                    if (!res.ok) throw new Error('Export ไม่สำเร็จ');
+                    blob = await res.blob();
+                }
+                if (blob) {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `RidersByVehicle_${start}_to_${end}.xlsx`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                }
+            } catch (err) {
+                alert('❌ ' + err.message);
+            }
+        };
+
+        // ─── Export Excel เฉพาะรถคันเดียว ───
+        window.reportsExportVehicle = async (vehicleId) => {
+            const start = this.startDate;
+            const end = this.endDate;
+            try {
+                let blob = null;
+                if (window.PayrollAPI?.exportVehicleExcel) {
+                    blob = await window.PayrollAPI.exportVehicleExcel(vehicleId, start, end);
+                } else {
+                    // fallback: เรียก endpoint ตรงถ้ายังไม่มี wrapper ใน PayrollAPI
+                    const res = await fetch(`${window.API_BASE}/payroll/export/vehicle/${vehicleId}?startDate=${start}&endDate=${end}`);
+                    if (!res.ok) throw new Error('Export ไม่สำเร็จ');
+                    blob = await res.blob();
+                }
+                if (blob) {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `Payroll_Vehicle${vehicleId}_${start}_to_${end}.xlsx`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                }
+            } catch (err) {
+                alert('❌ ' + err.message);
+            }
+        };
+
+        // ─── Modal ดูรายละเอียดรถ ───
+        window.reportsShowVehicleDetail = (vehicleId) => {
+            const data = this._lastData || Reports._lastData;
+            const v = (data.vehicles || []).find(x => x.vehicleId === vehicleId);
+            if (!v) return;
+
+            const vehicleTrips = (data.trips || [])
+                .filter(t => t.vehicleId === vehicleId)
+                .sort((a, b) =>
+                    String(a.operationDate).localeCompare(String(b.operationDate)) ||
+                    String(a.shiftCode).localeCompare(String(b.shiftCode))
+                );
+
+            const existing = document.getElementById('vehicleReportModal');
+            if (existing) existing.remove();
+
+            const modal = document.createElement('div');
+            modal.id = 'vehicleReportModal';
+            modal.style = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
+            modal.innerHTML = `
+                <div style="background:var(--surface);border-radius:12px;max-width:820px;width:100%;max-height:85vh;overflow:auto;padding:20px;" onclick="event.stopPropagation();">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                        <h3 style="margin:0;font-size:17px;">🚐 เบอร์ ${v.displayNumber} — ${v.plate || '-'}</h3>
+                        <button onclick="document.getElementById('vehicleReportModal').remove()" style="border:none;background:none;font-size:22px;cursor:pointer;color:var(--muted);">&times;</button>
+                    </div>
+                    <p style="color:var(--muted);font-size:13px;margin-bottom:14px;">
+                        คนขับหลัก: ${v.driver || '-'} • ช่วงวันที่: ${formatDateThai(Reports.startDate)} ถึง ${formatDateThai(Reports.endDate)}
+                    </p>
+
+                    <!-- สรุปตามรอบ -->
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:16px;">
+                        ${Object.values(v.shifts).map(s => `
+                            <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center;">
+                                <div style="font-size:12px;color:var(--muted);">${s.shiftName || s.shiftCode}</div>
+                                <div style="font-weight:700;color:var(--primary);font-size:16px;">${formatBaht(s.totalFare)}</div>
+                                <div style="font-size:11px;color:var(--muted);">${s.totalTrips} เที่ยว • ${s.totalRiders} คน</div>
+                            </div>
+                        `).join('')}
+                        <div style="background:var(--primary);color:#fff;border-radius:8px;padding:10px;text-align:center;">
+                            <div style="font-size:12px;opacity:.85;">รวมทั้งหมด</div>
+                            <div style="font-weight:700;font-size:16px;">${formatBaht(v.totalFare)}</div>
+                            <div style="font-size:11px;opacity:.85;">${v.totalTrips} เที่ยว • ${v.totalRiders} คน</div>
+                        </div>
+                    </div>
+
+                    <!-- รายละเอียดรายวัน -->
+                    <div class="table-wrapper" style="max-height:320px;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>วันที่</th>
+                                    <th>รอบ</th>
+                                    <th>คนขับ (บัตร)</th>
+                                    <th style="text-align:center;">พนักงาน</th>
+                                    <th style="text-align:center;">ค่ารถ</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${vehicleTrips.length === 0 ? `
+                                    <tr><td colspan="5" class="empty-row">ไม่มีข้อมูล</td></tr>
+                                ` : `
+                                    ${vehicleTrips.map(t => `
+                                        <tr>
+                                            <td>${formatDateThai(t.operationDate)}</td>
+                                            <td>${t.shiftName || t.shiftCode}${t.isManualOverride ? ' <span title="ปรับยอดเอง ไม่คำนวณจากรายชื่อพนักงาน" style="color:#d97706;">🔓</span>' : ''}</td>
+                                            <td>${t.driverCardId || '-'}</td>
+                                            <td style="text-align:center;">${t.totalRiders || 0}</td>
+                                            <td style="text-align:center;font-weight:600;color:var(--primary);">${formatBaht(t.totalFare)}</td>
+                                        </tr>
+                                    `).join('')}
+                                `}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div style="margin-top:16px;text-align:right;">
+                        <button class="btn btn-success btn-sm" onclick="window.reportsExportVehicle(${v.vehicleId})">
+                            <i class="fas fa-file-excel"></i> Export เฉพาะคันนี้
+                        </button>
+                    </div>
+                </div>
+            `;
+            modal.onclick = () => modal.remove();
+            document.body.appendChild(modal);
+        };
+
+        const apiStatusEl = document.getElementById('apiStatus');
+        if (apiStatusEl) apiStatusEl.textContent = '🟢 API: เชื่อมต่อแล้ว';
+    }
+};
+
+export default Reports;
