@@ -1,0 +1,1276 @@
+// ============================================================
+//  PAYROLL ROUTES — API Endpoints ทั้งหมด
+//  เส้นทาง: /api/payroll/*
+// ============================================================
+const express = require('express');
+const router = express.Router();
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+
+const { success, error, created, notFound, badRequest } = require('../utils/response');
+const { executeQuery } = require('../db');  // ✅ เพิ่มบรรทัดนี้
+const PayrollEngine = require('../services/payrollEngine');
+
+// ─── Multer ───
+// เก็บไฟล์อัปโหลดไว้ใน temp ของระบบ ไม่ใช่ใต้ api/ เพราะ nodemon จะเห็น
+// การสร้าง/ลบไฟล์แล้ว restart server ระหว่างที่ผู้ใช้กำลังนำเข้า
+const payrollUploadDir = path.join(os.tmpdir(), 'ga-dashboard-payroll-uploads');
+if (!fs.existsSync(payrollUploadDir)) {
+    fs.mkdirSync(payrollUploadDir, { recursive: true });
+}
+
+const upload = multer({
+    dest: payrollUploadDir,
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (ext === '.xlsx' || ext === '.xls') {
+            cb(null, true);
+        } else {
+            cb(new Error('เฉพาะไฟล์ Excel (.xlsx, .xls) เท่านั้น'));
+        }
+    },
+    limits: { fileSize: 10 * 1024 * 1024 }
+});
+
+// ─── 1. นำเข้า Excel ───
+router.post('/import', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return badRequest(res, 'กรุณาอัปโหลดไฟล์ Excel');
+        }
+
+        const filePath = req.file.path;
+        const filename = req.file.originalname;
+        const importedBy = req.body.importedBy || 'system';
+        const sourceType = req.body.sourceType || 'employee_file';
+
+        const result = await PayrollEngine.importExcel(filePath, filename, importedBy, sourceType);
+
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+        }
+
+        success(res, result, 'นำเข้าไฟล์สำเร็จ');
+    } catch (err) {
+        console.error('❌ POST /api/payroll/import error:', err);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        error(res, err.message);
+    }
+});
+// ─── สร้าง Payroll Period ───
+router.post('/period', async (req, res) => {
+    try {
+        const { startDate, endDate, label, createdBy } = req.body;
+
+        if (!startDate || !endDate || !label) {
+            return badRequest(res, 'Missing required fields: startDate, endDate, label');
+        }
+
+        const result = await PayrollEngine.createPayrollPeriod({
+            startDate,
+            endDate,
+            label,
+            createdBy: createdBy || 'system'
+        });
+
+        created(res, result, 'สร้างงวดจ่ายเงินสำเร็จ');
+    } catch (err) {
+        console.error('❌ POST /api/payroll/period error:', err);
+        error(res, err.message);
+    }
+});
+// ─── 2. ประมวลผล ───
+router.post('/process/:importId', async (req, res) => {
+    try {
+        const importId = parseInt(req.params.importId);
+        if (isNaN(importId)) {
+            return badRequest(res, 'Invalid importId');
+        }
+
+        const result = await PayrollEngine.processImport(importId, req.body?.force === true);
+        success(res, result, 'ประมวลผลสำเร็จ');
+    } catch (err) {
+        console.error('❌ POST /api/payroll/process/:importId error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 3. ดึงประวัติการนำเข้า ───
+router.get('/imports', async (req, res) => {
+    try {
+        const result = await PayrollEngine.getImports();
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/imports error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 4. ดึงรายละเอียดการนำเข้า ───
+router.get('/imports/:importId', async (req, res) => {
+    try {
+        const importId = parseInt(req.params.importId);
+        if (isNaN(importId)) {
+            return badRequest(res, 'Invalid importId');
+        }
+        const result = await PayrollEngine.getImportDetail(importId);
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/imports/:importId error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 5. ดึงรายชื่อ Unmatched ───
+router.get('/unmatched', async (req, res) => {
+    try {
+        const { status, page = 1, limit = 50 } = req.query;
+        const result = await PayrollEngine.getUnmatched(status, parseInt(page), parseInt(limit));
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/unmatched error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 6. สร้างพนักงานจาก Unmatched ───
+router.post('/unmatched/:id/create-employee', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+
+        const { firstName, lastName, department, section, cardId, fare, defaultVehicleId, type } = req.body;
+        const result = await PayrollEngine.createEmployeeFromUnmatched(id, {
+            firstName,
+            lastName,
+            department,
+            section,
+            cardId,
+            fare,
+            defaultVehicleId,
+            type
+        });
+
+        success(res, result, 'สร้างพนักงานสำเร็จ');
+    } catch (err) {
+        console.error('❌ POST /api/payroll/unmatched/:id/create-employee error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 6.1 ดึง Unmatched รายการเดียว (ใช้ตอนเปิด modal "สร้างพนักงาน" จากหน้าอื่น
+//     ที่ไม่ใช่แท็บ Unmatched เช่นหน้าจัดการวันนี้ ที่ยังไม่มีแคชรายการนี้อยู่) ───
+router.get('/unmatched/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+        // ✅ id ชนกันได้ข้าม 3 ตาราง (PayrollUnmatchedPersons / PayrollFareAlerts /
+        //    Employees) ต้องระบุ type มาด้วยเสมอ ไม่งั้นอาจได้ข้อมูลผิดคน
+        const type = req.query.type || 'unmatched';
+        const result = await PayrollEngine.getUnmatchedById(type, id);
+        if (!result) return notFound(res, 'ไม่พบข้อมูล');
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/unmatched/:id error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 6.2 ดึง Unmatched เฉพาะของวันที่ระบุ (ใช้โดยหน้าจัดการวันนี้ เพื่อรวมคนกลุ่มนี้
+//     เข้าไปแสดงในลิสต์ "🚐 ไม่ระบุรถ" ของรอบเวลานั้นๆ ไปเลย) ───
+router.get('/unmatched-by-date', async (req, res) => {
+    try {
+        const { date } = req.query;
+        if (!date) return badRequest(res, 'Missing date');
+        const result = await PayrollEngine.getUnmatchedByDate(date);
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/unmatched-by-date error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 7. ข้าม Unmatched ───
+router.put('/unmatched/:id/ignore', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+        const result = await PayrollEngine.ignoreUnmatched(id);
+        success(res, result, 'ข้ามรายการแล้ว');
+    } catch (err) {
+        console.error('❌ PUT /api/payroll/unmatched/:id/ignore error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 8. ดึงข้อมูลรายวัน ───
+router.get('/day/:date', async (req, res) => {
+    try {
+        const { date } = req.params;
+        const result = await PayrollEngine.getDaySummary(date);
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/day/:date error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 9. ดึง Operation Days (✅ เพิ่ม) ───
+router.get('/operation-days', async (req, res) => {
+    try {
+        const { startDate, endDate, date, status } = req.query;
+        let query = `SELECT * FROM PayrollOperationDays WHERE 1=1`;
+        const params = {};
+
+        if (date) {
+            query += ' AND operationDate = @date';
+            params.date = date;
+        }
+        if (startDate && endDate) {
+            query += ' AND operationDate BETWEEN @startDate AND @endDate';
+            params.startDate = startDate;
+            params.endDate = endDate;
+        }
+        if (status) {
+            query += ' AND status = @status';
+            params.status = status;
+        }
+
+        query += ' ORDER BY operationDate DESC';
+        const result = await require('../db').executeQuery(query, params);
+        success(res, result.recordset);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/operation-days error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 10. ดึง Vehicle Trips (✅ เพิ่ม) ───
+router.get('/vehicle-trips', async (req, res) => {
+    try {
+        const { operationDate, startDate, endDate, vehicleId, status } = req.query;
+        let query = `
+            SELECT vt.*, st.shiftCode, st.shiftName, st.fareType as shiftFareType,
+                   v.displayNumber, v.plate,
+                   v.driver AS defaultDriverName,
+                   de.name AS confirmedDriverName
+            FROM PayrollVehicleTrips vt
+            INNER JOIN PayrollShiftTypes st ON vt.shiftTypeId = st.id
+            INNER JOIN Vehicles v ON vt.vehicleId = v.id
+            LEFT JOIN Employees de ON vt.driverCardId COLLATE DATABASE_DEFAULT = de.cardId COLLATE DATABASE_DEFAULT AND de.isDriver = 1
+            WHERE vt.status != 'deleted'
+        `;
+        const params = {};
+
+        if (operationDate) {
+            query += ' AND vt.operationDate = @operationDate';
+            params.operationDate = operationDate;
+        }
+        if (startDate && endDate) {
+            query += ' AND vt.operationDate BETWEEN @startDate AND @endDate';
+            params.startDate = startDate;
+            params.endDate = endDate;
+        }
+        if (vehicleId) {
+            query += ' AND vt.vehicleId = @vehicleId';
+            params.vehicleId = parseInt(vehicleId);
+        }
+        if (status) {
+            query += ' AND vt.status = @status';
+            params.status = status;
+        }
+
+        query += ' ORDER BY vt.operationDate DESC, st.displayOrder';
+        const result = await require('../db').executeQuery(query, params);
+        success(res, result.recordset);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/vehicle-trips error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 11. ดึง Trip Employees (✅ เพิ่ม) ───
+router.get('/trip-employees', async (req, res) => {
+    try {
+        const { vehicleTripId, employeeId } = req.query;
+        let query = `
+            SELECT te.*, e.name, e.cardId, e.department, e.section
+            FROM PayrollTripEmployees te
+            INNER JOIN Employees e ON te.employeeId = e.id
+            WHERE 1=1
+        `;
+        const params = {};
+
+        if (vehicleTripId) {
+            query += ' AND te.vehicleTripId = @vehicleTripId';
+            params.vehicleTripId = parseInt(vehicleTripId);
+        }
+        if (employeeId) {
+            query += ' AND te.employeeId = @employeeId';
+            params.employeeId = parseInt(employeeId);
+        }
+
+        query += ' ORDER BY te.id';
+        const result = await require('../db').executeQuery(query, params);
+        success(res, result.recordset);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/trip-employees error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── เพิ่มพนักงานที่ค้นหาจากทะเบียนพนักงานเข้าเที่ยวรถ ───
+router.post('/trip-employees', async (req, res) => {
+    try {
+        const { vehicleTripId, employeeId, userId } = req.body;
+        if (!vehicleTripId || !employeeId) return badRequest(res, 'Missing vehicleTripId or employeeId');
+
+        const result = await PayrollEngine.addEmployeeToTrip(
+            parseInt(vehicleTripId), parseInt(employeeId), userId || 'system'
+        );
+        created(res, result, 'เพิ่มพนักงานเข้ารถสำเร็จ');
+    } catch (err) {
+        console.error('❌ POST /api/payroll/trip-employees error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 11b. ลบพนักงานคนเดียวออกจากเที่ยวรถ (✅ เพิ่ม) ───
+router.delete('/trip-employees/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return badRequest(res, 'Invalid id');
+        const userId = req.body?.userId || req.query.userId || 'system';
+
+        const result = await PayrollEngine.removeTripEmployee(id, userId);
+        success(res, result, 'ลบพนักงานออกจากเที่ยวรถสำเร็จ');
+    } catch (err) {
+        console.error('❌ DELETE /api/payroll/trip-employees/:id error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 12. ดึง Fare Alerts (✅ เพิ่ม) ───
+router.get('/fare-alerts', async (req, res) => {
+    try {
+        const { status, limit = 50 } = req.query;
+        let query = `SELECT * FROM PayrollFareAlerts WHERE 1=1`;
+        const params = {};
+
+        if (status) {
+            query += ' AND status = @status';
+            params.status = status;
+        }
+
+        query += ` ORDER BY createdAt DESC`;
+        if (limit) {
+            query += ` OFFSET 0 ROWS FETCH NEXT @limit ROWS ONLY`;
+            params.limit = parseInt(limit);
+        }
+
+        const result = await require('../db').executeQuery(query, params);
+        success(res, result.recordset);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/fare-alerts error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 13. ดึงสรุปเดือน ───
+router.get('/month/:yearMonth', async (req, res) => {
+    try {
+        const { yearMonth } = req.params;
+        const result = await PayrollEngine.getMonthSummary(yearMonth);
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/month/:yearMonth error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 14. อนุมัติวัน ───
+router.put('/day/:date/approve', async (req, res) => {
+    try {
+        const { date } = req.params;
+        const { userId } = req.body;
+        const result = await PayrollEngine.approveDay(date, userId || 'system');
+        success(res, result, 'อนุมัติวันสำเร็จ');
+    } catch (err) {
+        console.error('❌ PUT /api/payroll/day/:date/approve error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 15. ล็อกวัน ───
+router.put('/day/:date/lock', async (req, res) => {
+    try {
+        const { date } = req.params;
+        const { userId } = req.body;
+        const result = await PayrollEngine.lockDay(date, userId || 'system');
+        success(res, result, 'ล็อกวันสำเร็จ');
+    } catch (err) {
+        console.error('❌ PUT /api/payroll/day/:date/lock error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 16. สรุปรายงาน ───
+router.get('/report', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) {
+            return badRequest(res, 'Missing startDate or endDate');
+        }
+        const result = await PayrollEngine.getReport(startDate, endDate);
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/report error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 17. Export Excel ───
+router.get('/export', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) {
+            return badRequest(res, 'Missing startDate or endDate');
+        }
+
+        const buffer = await PayrollEngine.exportExcel(startDate, endDate);
+        
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=Payroll_${startDate}_to_${endDate}.xlsx`);
+        res.send(buffer);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/export error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 17b. Export Excel เฉพาะรถคันเดียว ───
+router.get('/export/vehicle/:vehicleId', async (req, res) => {
+    try {
+        const { vehicleId } = req.params;
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) {
+            return badRequest(res, 'Missing startDate or endDate');
+        }
+
+        const buffer = await PayrollEngine.exportVehicleExcel(vehicleId, startDate, endDate);
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=Payroll_Vehicle${vehicleId}_${startDate}_to_${endDate}.xlsx`);
+        res.send(buffer);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/export/vehicle/:vehicleId error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 17c. Export Excel: รายชื่อพนักงานที่นั่งรถแต่ละคัน ───
+router.get('/export/employee-list-by-vehicle', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) {
+            return badRequest(res, 'Missing startDate or endDate');
+        }
+
+        const buffer = await PayrollEngine.exportEmployeeListByVehicle(startDate, endDate);
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=RiderList_${startDate}_to_${endDate}.xlsx`);
+        res.send(buffer);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/export/employee-list-by-vehicle error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 17d. Export Excel: เช็คชื่อ มา/ไม่มา รายคัน (ให้คนขับเช็คกับตัวจริง) ───
+router.get('/export/attendance-checklist', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) {
+            return badRequest(res, 'Missing startDate or endDate');
+        }
+
+        const buffer = await PayrollEngine.exportAttendanceChecklistByVehicle(startDate, endDate);
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=AttendanceChecklist_${startDate}_to_${endDate}.xlsx`);
+        res.send(buffer);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/export/attendance-checklist error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 17e. Export Excel: รายชื่อพนักงานที่นั่งรถแต่ละคัน (เอากลับมาตามที่ขอ) ───
+router.get('/export/riders-by-vehicle', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) {
+            return badRequest(res, 'Missing startDate or endDate');
+        }
+
+        const buffer = await PayrollEngine.exportRidersByVehicle(startDate, endDate);
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=RidersByVehicle_${startDate}_to_${endDate}.xlsx`);
+        res.send(buffer);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/export/riders-by-vehicle error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── ดึง Settings ───
+router.get('/settings', async (req, res) => {
+    try {
+        const { type } = req.query;
+        
+        // ✅ ถ้ามี type=shift ให้ส่งเฉพาะ shiftTypes
+        if (type === 'shift') {
+            const result = await executeQuery(`
+                SELECT * FROM PayrollShiftTypes ORDER BY displayOrder
+            `);
+            return success(res, result.recordset);
+        }
+        
+        // ✅ ถ้ามี type=rate ให้ส่งเฉพาะ rates
+        if (type === 'rate') {
+            const result = await executeQuery(`
+                SELECT * FROM PayrollRateSettings WHERE isActive = 1 ORDER BY shiftCode
+            `);
+            return success(res, result.recordset);
+        }
+
+        // ✅ ถ้าไม่มี type ให้ส่งทั้งสอง
+        const shiftTypes = await executeQuery(`
+            SELECT * FROM PayrollShiftTypes ORDER BY displayOrder
+        `);
+        const rates = await executeQuery(`
+            SELECT * FROM PayrollRateSettings WHERE isActive = 1 ORDER BY shiftCode
+        `);
+
+        success(res, {
+            shiftTypes: shiftTypes.recordset,
+            rates: rates.recordset
+        });
+    } catch (err) {
+        console.error('❌ GET /api/payroll/settings error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 20a. เพิ่มรอบใหม่ (Custom Shift Type) ───
+//    ⚠️ ต้อง insert คู่กัน 2 ตาราง: PayrollShiftTypes (metadata ของรอบ)
+//    และ PayrollRateSettings (ราคาจริงที่ addVehicleTrip() ใช้ตอนคำนวณ —
+//    ถ้า insert แค่ PayrollShiftTypes เฉยๆ รอบใหม่จะได้ fareUsed = 0 เสมอ)
+router.post('/shift-types', async (req, res) => {
+    try {
+        const { shiftName, startTime, endTime, fareType, defaultRate } = req.body;
+
+        if (!shiftName || !startTime || !endTime || !fareType) {
+            return badRequest(res, 'Missing required fields: shiftName, startTime, endTime, fareType');
+        }
+        const allowedFareTypes = ['perHead', 'flatByVehicle', 'perTrip'];
+        if (!allowedFareTypes.includes(fareType)) {
+            return badRequest(res, `fareType ต้องเป็นหนึ่งใน: ${allowedFareTypes.join(', ')}`);
+        }
+
+        const rate = parseFloat(defaultRate) || 0;
+
+        // ✅ สร้าง shiftCode อัตโนมัติ (ไม่ซ้ำ) จากชื่อรอบ + timestamp
+        const slug = shiftName
+            .trim()
+            .toUpperCase()
+            .replace(/[^A-Z0-9ก-๙]+/g, '_')
+            .replace(/^_+|_+$/g, '')
+            .slice(0, 30) || 'CUSTOM';
+        const shiftCode = `${slug}_${Date.now()}`;
+
+        const orderResult = await executeQuery(`
+            SELECT ISNULL(MAX(displayOrder), 0) AS maxOrder FROM PayrollShiftTypes
+        `);
+        const displayOrder = (orderResult.recordset[0].maxOrder || 0) + 1;
+
+        const shiftResult = await executeQuery(`
+            INSERT INTO PayrollShiftTypes (
+                shiftCode, shiftName, startTime, endTime, fareType, defaultRate, isActive, displayOrder
+            )
+            OUTPUT INSERTED.id
+            VALUES (
+                @shiftCode, @shiftName, @startTime, @endTime, @fareType, @defaultRate, 1, @displayOrder
+            )
+        `, { shiftCode, shiftName, startTime, endTime, fareType, defaultRate: rate, displayOrder });
+
+        const shiftTypeId = shiftResult.recordset[0].id;
+
+        await executeQuery(`
+            INSERT INTO PayrollRateSettings (shiftCode, rateType, rate, effectiveFrom, isActive)
+            VALUES (@shiftCode, @rateType, @rate, CAST(GETDATE() AS DATE), 1)
+        `, { shiftCode, rateType: fareType, rate });
+
+        created(res, { id: shiftTypeId, shiftCode, shiftName, startTime, endTime, fareType, defaultRate: rate, displayOrder }, 'สร้างรอบใหม่สำเร็จ');
+    } catch (err) {
+        console.error('❌ POST /api/payroll/shift-types error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── แก้ไขรอบ (ชื่อ และ/หรือ วิธีคิดราคา/อัตรา) ───
+router.patch('/shift-types/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return badRequest(res, 'Invalid id');
+
+        const { shiftName, fareType, defaultRate } = req.body || {};
+        const hasShiftName = shiftName !== undefined && shiftName !== null && String(shiftName).trim() !== '';
+        const hasFareType = fareType !== undefined && fareType !== null && String(fareType).trim() !== '';
+        const hasDefaultRate = defaultRate !== undefined && defaultRate !== null && String(defaultRate).trim() !== '';
+
+        if (!hasShiftName && !hasFareType && !hasDefaultRate) {
+            return badRequest(res, 'ต้องระบุอย่างน้อยหนึ่งอย่าง: shiftName, fareType, defaultRate');
+        }
+
+        const existing = await executeQuery('SELECT * FROM PayrollShiftTypes WHERE id = @id', { id });
+        const shift = existing.recordset[0];
+        if (!shift) return notFound(res, 'Shift type not found');
+
+        const updates = [];
+        const params = { id };
+
+        // ✅ เปลี่ยนชื่อ — จำกัดเฉพาะรอบที่สร้างเอง (built-in ห้ามเปลี่ยนชื่อ) เหมือนเดิม
+        if (hasShiftName) {
+            if (!/_\d{10,}$/.test(shift.shiftCode || '')) {
+                return badRequest(res, 'แก้ไขชื่อได้เฉพาะรอบที่สร้างเอง');
+            }
+            updates.push('shiftName = @shiftName');
+            params.shiftName = String(shiftName).trim();
+        }
+
+        // ✅ เปลี่ยนวิธีคิดราคา/อัตรา — ใช้ได้ทุกรอบ รวมถึง built-in (ตรงกับที่หน้าบ้านตั้งใจไว้)
+        if (hasFareType) {
+            const allowedFareTypes = ['perHead', 'flatByVehicle', 'perTrip'];
+            if (!allowedFareTypes.includes(fareType)) {
+                return badRequest(res, `fareType ต้องเป็นหนึ่งใน: ${allowedFareTypes.join(', ')}`);
+            }
+            updates.push('fareType = @fareType');
+            params.fareType = fareType;
+        }
+
+        if (hasDefaultRate) {
+            const rate = parseFloat(defaultRate);
+            if (isNaN(rate) || rate < 0) return badRequest(res, 'defaultRate ต้องเป็นตัวเลขไม่ติดลบ');
+            updates.push('defaultRate = @defaultRate');
+            params.defaultRate = rate;
+        }
+
+        await executeQuery(`UPDATE PayrollShiftTypes SET ${updates.join(', ')} WHERE id = @id`, params);
+
+        // ✅ Sync ไปที่ PayrollRateSettings ด้วย — นี่คือตารางที่ processFlatByVehicleShift
+        //    ใช้ดึงราคาจริงตอนคำนวณ (ดู POST /shift-types ด้านบน) ถ้าไม่ sync ตรงนี้
+        //    แก้ราคาในหน้าจอแล้วจะไม่มีผลกับการคำนวณจริง
+        if (hasFareType || hasDefaultRate) {
+            const finalFareType = hasFareType ? fareType : shift.fareType;
+            const finalRate = hasDefaultRate ? parseFloat(defaultRate) : (shift.defaultRate || 0);
+
+            await executeQuery(`
+                UPDATE PayrollRateSettings SET isActive = 0
+                WHERE shiftCode = @shiftCode AND isActive = 1
+            `, { shiftCode: shift.shiftCode });
+
+            await executeQuery(`
+                INSERT INTO PayrollRateSettings (shiftCode, rateType, rate, effectiveFrom, isActive)
+                VALUES (@shiftCode, @rateType, @rate, CAST(GETDATE() AS DATE), 1)
+            `, { shiftCode: shift.shiftCode, rateType: finalFareType, rate: finalRate });
+        }
+
+        const updated = await executeQuery('SELECT * FROM PayrollShiftTypes WHERE id = @id', { id });
+        success(res, updated.recordset[0], 'แก้ไขรอบสำเร็จ');
+    } catch (err) {
+        console.error('❌ PATCH /api/payroll/shift-types/:id error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── ลบรอบที่สร้างเอง (ต้องยังไม่ถูกใช้งาน) ───
+router.delete('/shift-types/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return badRequest(res, 'Invalid id');
+
+        const existing = await executeQuery('SELECT * FROM PayrollShiftTypes WHERE id = @id', { id });
+        const shift = existing.recordset[0];
+        if (!shift) return notFound(res, 'Shift type not found');
+        if (!/_\d{10,}$/.test(shift.shiftCode || '')) return badRequest(res, 'ลบได้เฉพาะรอบที่สร้างเอง');
+
+        const usage = await executeQuery(`
+            SELECT
+                (SELECT COUNT(*) FROM PayrollVehicleTrips WHERE shiftTypeId = @id) +
+                (SELECT COUNT(*) FROM PayrollUnassignedRiders WHERE shiftTypeId = @id) AS total
+        `, { id });
+        if (usage.recordset[0]?.total > 0) {
+            return badRequest(res, 'ลบรอบนี้ไม่ได้ เพราะมีรถหรือพนักงานถูกผูกกับรอบแล้ว');
+        }
+
+        await executeQuery('DELETE FROM PayrollRateSettings WHERE shiftCode = @shiftCode', { shiftCode: shift.shiftCode });
+        await executeQuery('DELETE FROM PayrollShiftTypes WHERE id = @id', { id });
+        success(res, { id }, 'ลบรอบสำเร็จ');
+    } catch (err) {
+        console.error('❌ DELETE /api/payroll/shift-types/:id error:', err);
+        error(res, err.message);
+    }
+});
+//    ⚠️ Route นี้หายไปก่อนหน้านี้ — PayrollEngine.addVehicleTrip() มีอยู่แล้ว
+//    ในเซอร์วิสแต่ไม่มี route มาเรียกใช้ ทำให้ปุ่ม "เพิ่มรถเข้ารอบ" ใน
+//    daily.js (fetch ไปที่ POST /api/payroll/vehicle-trip) ยิงไปแล้วได้ 404
+router.post('/vehicle-trip', async (req, res) => {
+    try {
+        const { operationDate, shiftTypeId, vehicleId, driverCardId, note, createdBy } = req.body;
+
+        if (!operationDate || !shiftTypeId || !vehicleId) {
+            return badRequest(res, 'Missing required fields: operationDate, shiftTypeId, vehicleId');
+        }
+
+        const result = await PayrollEngine.addVehicleTrip({
+            operationDate,
+            shiftTypeId: parseInt(shiftTypeId),
+            vehicleId: parseInt(vehicleId),
+            driverCardId: driverCardId || null,
+            note,
+            createdBy: createdBy || 'system'
+        });
+
+        created(res, result, 'เพิ่มรถเข้ารอบสำเร็จ');
+    } catch (err) {
+        console.error('❌ POST /api/payroll/vehicle-trip error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 21. ลบรถออกจากรอบ ───
+router.delete('/vehicle-trip/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+        const userId = req.query.userId || 'system';
+        const result = await PayrollEngine.removeVehicleTrip(id, userId);
+        success(res, result, 'ลบรถสำเร็จ');
+    } catch (err) {
+        console.error('❌ DELETE /api/payroll/vehicle-trip/:id error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 22. แก้ไข Assignment ───
+router.patch('/assignment/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+
+        // ⚠️ แก้บั๊ก: เดิม route นี้ไม่ได้ดึง totalRiders/manualOverride จาก req.body เลย
+        //    ทำให้ต่อให้พิมพ์ "จำนวนพนักงาน" ใหม่ในหน้าแก้ไขเที่ยวรถแล้วกดบันทึก
+        //    ค่าที่กรอกก็ไม่เคยถูกส่งต่อไปให้ PayrollEngine.updateAssignment เลย
+        const { vehicleId, fare, totalRiders, employeeIds, shiftTypeId, note, driverCardId, tripCount, manualOverride } = req.body;
+        const userId = req.body.userId || 'system';
+
+        const result = await PayrollEngine.updateAssignment(id, {
+            vehicleId,
+            fare,
+            totalRiders,
+            employeeIds,
+            shiftTypeId,
+            note,
+            driverCardId,
+            tripCount,
+            manualOverride,
+            userId
+        });
+
+        success(res, result, 'อัปเดตสำเร็จ');
+    } catch (err) {
+        console.error('❌ PATCH /api/payroll/assignment/:id error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── 23. ดึง Audit Log ───
+router.get('/audit', async (req, res) => {
+    try {
+        const { tableName, recordId, limit = 50 } = req.query;
+        const result = await PayrollEngine.getAuditLog(tableName, recordId, parseInt(limit));
+        success(res, result);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/audit error:', err);
+        error(res, err.message);
+    }
+});
+// ─── ยกเลิกอนุมัติวัน ───
+router.put('/day/:date/unapprove', async (req, res) => {
+    try {
+        const { date } = req.params;
+        const { userId } = req.body;
+
+        const result = await executeQuery(`
+            UPDATE PayrollOperationDays SET
+                status = 'completed',
+                approvedBy = NULL,
+                approvedAt = NULL,
+                updatedAt = GETDATE()
+            WHERE operationDate = @date AND status = 'approved'
+        `, { date });
+
+        if (result.rowsAffected[0] === 0) {
+            return badRequest(res, 'ไม่สามารถยกเลิกได้ (วันนี้ไม่ได้อยู่ในสถานะ approved)');
+        }
+
+        // ✅ ใช้ action = 'UPDATE'
+        await executeQuery(`
+            INSERT INTO PayrollAuditLogs (tableName, recordId, fieldName, newValue, action, userId)
+            VALUES ('PayrollOperationDays', 0, 'status', 'completed', 'UPDATE', @userId)
+        `, { userId: userId || 'system' });
+
+        success(res, { date, status: 'completed' }, 'ยกเลิกอนุมัติสำเร็จ');
+    } catch (err) {
+        console.error('❌ PUT /api/payroll/day/:date/unapprove error:', err);
+        error(res, err.message);
+    }
+});
+// ─── จัดคนลงรถอัตโนมัติ (เฉพาะรอบเหมาคัน/เหมาเที่ยว — ห้ามใช้กับรอบคิดค่าหัว) ───
+router.post('/vehicle-trips/auto-assign-riders', async (req, res) => {
+    try {
+        const { operationDate, shiftTypeId, userId } = req.body;
+        if (!operationDate || !shiftTypeId) {
+            return badRequest(res, 'Missing operationDate or shiftTypeId');
+        }
+        const result = await PayrollEngine.assignRidersToTrips(operationDate, parseInt(shiftTypeId), userId || 'admin');
+        success(res, result, result.message);
+    } catch (err) {
+        console.error('❌ POST /api/payroll/vehicle-trips/auto-assign-riders error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── ดึง Vehicle Trip เดี่ยว ───
+router.get('/vehicle-trip/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+
+        const result = await executeQuery(`
+            SELECT vt.*, st.shiftCode, st.shiftName,
+                   v.displayNumber, v.plate,
+                   v.driver AS defaultDriverName,
+                   de.name AS confirmedDriverName
+            FROM PayrollVehicleTrips vt
+            INNER JOIN PayrollShiftTypes st ON vt.shiftTypeId = st.id
+            INNER JOIN Vehicles v ON vt.vehicleId = v.id
+            LEFT JOIN Employees de ON vt.driverCardId COLLATE DATABASE_DEFAULT = de.cardId COLLATE DATABASE_DEFAULT AND de.isDriver = 1
+            WHERE vt.id = @id AND vt.status != 'deleted'
+        `, { id });
+
+        if (result.recordset.length === 0) {
+            return notFound(res, 'ไม่พบข้อมูล Vehicle Trip');
+        }
+
+        success(res, result.recordset[0]);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/vehicle-trip/:id error:', err);
+        error(res, err.message);
+    }
+});
+// ─── รีเซ็ตสถานะ Unmatched ───
+router.put('/unmatched/:id/reset', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+
+        const result = await executeQuery(`
+            UPDATE PayrollUnmatchedPersons SET
+                status = 'pending',
+                updatedAt = GETDATE()
+            WHERE id = @id
+        `, { id });
+
+        if (result.rowsAffected[0] === 0) {
+            return notFound(res, 'ไม่พบข้อมูล');
+        }
+
+        success(res, { id, status: 'pending' }, 'รีเซ็ตสถานะสำเร็จ');
+    } catch (err) {
+        console.error('❌ PUT /api/payroll/unmatched/:id/reset error:', err);
+        error(res, err.message);
+    }
+});
+// ============================================================
+//  PHASE C: API Endpoints ใหม่ (Unassigned Riders + Vehicle Rates)
+// ============================================================
+
+// ─── GET Unassigned Riders ───
+router.get('/unassigned-riders', async (req, res) => {
+    try {
+        const { date, shiftTypeId, status } = req.query;
+        let query = `
+            SELECT ur.*, 
+                   e.name as employeeName,
+                   v.displayNumber as expectedVehicleDisplay,
+                   st.shiftName
+            FROM PayrollUnassignedRiders ur
+            LEFT JOIN Employees e ON ur.employeeId = e.id
+            LEFT JOIN Vehicles v ON ur.expectedVehicleId = v.id
+            LEFT JOIN PayrollShiftTypes st ON ur.shiftTypeId = st.id
+            WHERE 1=1
+        `;
+        const params = {};
+
+        if (date) { 
+            query += ' AND ur.operationDate = @date'; 
+            params.date = date; 
+        }
+        if (shiftTypeId) { 
+            query += ' AND ur.shiftTypeId = @shiftTypeId'; 
+            params.shiftTypeId = parseInt(shiftTypeId); 
+        }
+        if (status) { 
+            query += ' AND ur.status = @status'; 
+            params.status = status; 
+        }
+
+        query += ' ORDER BY ur.expectedVehicleId, ur.id';
+        const result = await executeQuery(query, params);
+        success(res, result.recordset);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/unassigned-riders error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── PUT Resolve: เพิ่มพนักงานที่ยังไม่มีรถ เข้ารถที่เลือก ───
+// ⚠️ เพิ่มใหม่: route นี้ขาดหายไป — daily.js เรียกอยู่แล้วตอนกด "+ เพิ่มพนักงาน"
+//    แล้วเลือกคนจากลิสต์ "ยังไม่มีรถ" ทำให้ได้ 404 มาตลอด
+router.put('/unassigned-riders/:id/resolve', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { vehicleId, userId } = req.body;
+
+        if (!vehicleId) {
+            return badRequest(res, 'Missing vehicleId');
+        }
+
+        const result = await PayrollEngine.resolveUnassignedRider(
+            parseInt(id), parseInt(vehicleId), userId || 'system'
+        );
+        success(res, result, 'เพิ่มพนักงานเข้ารถสำเร็จ');
+    } catch (err) {
+        console.error('❌ PUT /api/payroll/unassigned-riders/:id/resolve error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── POST Resolve: Add Driver (เพิ่มคนขับให้รถ) ───
+//    ⚠️ แก้บั๊กรอบใหญ่: เดิมพยายามแกล้งสร้างแถวสแกน (PayrollScanRows) แล้วเรียก
+//    processDay() ให้ไปประมวลผลใหม่ทั้งวัน โดยหวังว่าตัวจับคู่อัตโนมัติ (เช็คเวลา,
+//    เช็ค VehicleDriverMap, เช็ค shiftCode ฯลฯ) จะไปสร้างเที่ยวรถให้เอง — วิธีนี้เปราะบาง
+//    มาก มีจุดพังได้หลายจุด (ตามที่เจอมาแล้ว 3 รอบ) และไม่ตรงกับที่ "เพิ่มรถเข้ารอบ"
+//    ทำอยู่แล้ว (เรียก PayrollEngine.addVehicleTrip สร้างเที่ยวรถตรง ๆ ทันที ไม่พึ่งการ
+//    ประมวลผลใหม่เลย) ตอนนี้เปลี่ยนมาใช้วิธีเดียวกัน: สร้าง/อัปเดตเที่ยวรถตรง ๆ
+//    แล้วย้ายพนักงานที่ค้างอยู่ในกลุ่มนี้เข้าเที่ยวทันที (แบบเดียวกับปุ่ม "+ เพิ่มพนักงาน")
+router.post('/unassigned-riders/resolve-add-driver', async (req, res) => {
+    try {
+        const { vehicleId, operationDate, shiftTypeId, cardId, userId } = req.body;
+
+        if (!vehicleId || !operationDate || !shiftTypeId || !cardId) {
+            return badRequest(res, 'Missing required fields: vehicleId, operationDate, shiftTypeId, cardId');
+        }
+
+        // ✅ 1. ตรวจสอบว่าคนขับนี้เป็นคนขับของรถคันนี้จริง (จาก VehicleDriverMap — ตารางเดียวกับที่
+        //    payrollEngine.js ใช้จับคู่รถ/คนขับตอนประมวลผลไฟล์สแกนจริง เพื่อให้ผลตรงกันเสมอ)
+        const checkDriver = await executeQuery(`
+            SELECT vdm.vehicleId FROM VehicleDriverMap vdm
+            INNER JOIN Vehicles v ON v.id = vdm.vehicleId
+            WHERE vdm.vehicleId = @vehicleId AND vdm.cardId = @cardId
+              AND vdm.isDeleted = 0 AND v.status = 'active'
+        `, { vehicleId, cardId });
+
+        if (checkDriver.recordset.length === 0) {
+            return badRequest(res, 'คนขับคนนี้ยังไม่ได้ถูกกำหนดให้รถคันนี้ในหน้า "กำหนดคนขับรถ" กรุณาไปเพิ่มที่นั่นก่อน');
+        }
+
+        // ✅ 2. หาเที่ยวรถของ (วันที่, รอบ, รถ) นี้ก่อน — ถ้ามีอยู่แล้ว (เช่น ถูกสร้างจากไฟล์สแกน
+        //    แต่ driverCardId ยังว่าง) ให้แค่เติมคนขับเข้าไป ถ้ายังไม่มีเลยให้สร้างใหม่พร้อมคนขับทันที
+        const tripResult = await executeQuery(`
+            SELECT id FROM PayrollVehicleTrips
+            WHERE operationDate = @operationDate AND shiftTypeId = @shiftTypeId
+              AND vehicleId = @vehicleId AND status != 'deleted'
+        `, { operationDate, shiftTypeId, vehicleId });
+
+        let tripId;
+        if (tripResult.recordset.length > 0) {
+            tripId = tripResult.recordset[0].id;
+            await PayrollEngine.updateAssignment(tripId, { driverCardId: cardId, userId: userId || 'admin' });
+        } else {
+            const createdTrip = await PayrollEngine.addVehicleTrip({
+                operationDate,
+                shiftTypeId: parseInt(shiftTypeId),
+                vehicleId: parseInt(vehicleId),
+                driverCardId: cardId,
+                createdBy: userId || 'admin'
+            });
+            tripId = createdTrip.id;
+        }
+
+        // ✅ 3. ย้ายพนักงานที่ค้างอยู่ในกลุ่มนี้ (วันเดียวกัน รอบเดียวกัน รอรถคันนี้) เข้าเที่ยวที่เพิ่งสร้าง/อัปเดตทันที
+        //    ใช้ resolveUnassignedRider ตัวเดียวกับที่ปุ่ม "+ เพิ่มพนักงาน" ใช้ ไม่ต้องพึ่ง processDay เลย
+        const pendingRiders = await executeQuery(`
+            SELECT id FROM PayrollUnassignedRiders
+            WHERE operationDate = @operationDate AND shiftTypeId = @shiftTypeId
+              AND expectedVehicleId = @vehicleId AND status = 'pending'
+        `, { operationDate, shiftTypeId, vehicleId });
+
+        let movedCount = 0;
+        for (const row of pendingRiders.recordset) {
+            try {
+                await PayrollEngine.resolveUnassignedRider(row.id, vehicleId, userId || 'admin');
+                movedCount++;
+            } catch (moveErr) {
+                console.warn(`⚠️ resolve-add-driver: ย้ายพนักงาน (unassignedId=${row.id}) เข้ารถไม่สำเร็จ:`, moveErr.message);
+            }
+        }
+
+        success(res, { tripId, movedCount }, `เพิ่มคนขับสำเร็จ${movedCount > 0 ? ` และย้ายพนักงาน ${movedCount} คนเข้ารถแล้ว` : ''}`);
+    } catch (err) {
+        console.error('❌ POST /api/payroll/unassigned-riders/resolve-add-driver error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── POST Resolve: Move (ย้ายพนักงานไปรถอื่น) ───
+// ⚠️ แก้บั๊ก: เดิมแค่ UPDATE expectedVehicleId + status ของแถว PayrollUnassignedRiders
+//    แล้วเรียก PayrollEngine.processDay(operationDate, {}, {}) โดยส่ง employeeMap/driverMap
+//    เป็น {} ว่างเปล่า (ผิด signature — processDay ต้องการแผนที่จริงจาก DB) และในทางปฏิบัติ
+//    ก็ไม่มีผลอะไรเลยอยู่ดี เพราะแถว PayrollScanRows ของวันนั้นถูก mark 'matched' ไปแล้ว
+//    ตั้งแต่ import ครั้งแรก — ผลคือพนักงานที่ "ย้าย" หายไปจาก banner "ยังไม่ถูกจัดขึ้นรถ"
+//    (เพราะ status ไม่ใช่ pending แล้ว) แต่ไม่เคยถูกสร้างแถวจริงใน PayrollTripEmployees
+//    ของรถปลายทางเลย คือหายไปเฉยๆ ไม่ได้ถูกจัดรถจริง
+//    ตอนนี้เปลี่ยนมาใช้ PayrollEngine.resolveUnassignedRider() ตัวเดียวกับปุ่ม
+//    "+ เพิ่มพนักงาน" และ resolve-add-driver ด้านบน เพื่อสร้างแถวจริงในรถปลายทางทันที
+router.post('/unassigned-riders/resolve-move', async (req, res) => {
+    try {
+        const { vehicleId, operationDate, shiftTypeId, targetVehicleId, userId } = req.body;
+
+        if (!operationDate || !shiftTypeId || !targetVehicleId) {
+            return badRequest(res, 'Missing required fields');
+        }
+
+        // ✅ 1. ตรวจสอบว่ารถปลายทางมีเที่ยวอยู่แล้วในรอบนี้ (ถ้ายังไม่มีเที่ยว ยังย้ายเข้าไปไม่ได้)
+        const targetTrip = await executeQuery(`
+            SELECT id FROM PayrollVehicleTrips 
+            WHERE operationDate = @operationDate 
+            AND shiftTypeId = @shiftTypeId 
+            AND vehicleId = @targetVehicleId
+            AND status != 'deleted'
+        `, { operationDate, shiftTypeId, targetVehicleId });
+
+        if (targetTrip.recordset.length === 0) {
+            return badRequest(res, 'รถปลายทางยังไม่มีเที่ยวรถในรอบนี้ กรุณา "เพิ่มรถเข้ารอบ" หรือ "เพิ่มคนขับ" ให้รถคันนั้นก่อน');
+        }
+
+        // ✅ 2. หาพนักงานที่รอย้ายจริง (วันเดียวกัน รอบเดียวกัน รอรถต้นทางคันนี้ และยัง pending)
+        let query = `
+            SELECT id FROM PayrollUnassignedRiders
+            WHERE operationDate = @operationDate AND shiftTypeId = @shiftTypeId AND status = 'pending'
+        `;
+        const params = { operationDate, shiftTypeId };
+        if (vehicleId) {
+            query += ' AND expectedVehicleId = @vehicleId';
+            params.vehicleId = vehicleId;
+        } else {
+            query += ' AND expectedVehicleId IS NULL';
+        }
+
+        const pendingRiders = await executeQuery(query, params);
+
+        if (pendingRiders.recordset.length === 0) {
+            return badRequest(res, 'ไม่พบพนักงานที่รอย้ายในกลุ่มนี้ (อาจถูกจัดการไปแล้ว)');
+        }
+
+        // ✅ 3. ย้ายทีละคนด้วย resolveUnassignedRider ตัวจริง (สร้างแถวใน PayrollTripEmployees
+        //    ของรถปลายทาง + ปิดสถานะ pending) แทนการ UPDATE เฉยๆ แบบเดิม
+        let movedCount = 0;
+        const failures = [];
+        for (const row of pendingRiders.recordset) {
+            try {
+                await PayrollEngine.resolveUnassignedRider(row.id, targetVehicleId, userId || 'admin');
+                movedCount++;
+            } catch (moveErr) {
+                console.warn(`⚠️ resolve-move: ย้ายพนักงาน (unassignedId=${row.id}) ไม่สำเร็จ:`, moveErr.message);
+                failures.push(moveErr.message);
+            }
+        }
+
+        if (movedCount === 0) {
+            return badRequest(res, failures[0] || 'ย้ายพนักงานไม่สำเร็จ');
+        }
+
+        success(res, { movedCount }, `ย้ายพนักงาน ${movedCount} คน ไปรถปลายทางสำเร็จ`);
+    } catch (err) {
+        console.error('❌ POST /api/payroll/unassigned-riders/resolve-move error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── PUT Ignore: ลบคนออกจากแบนเนอร์ "ยังไม่ถูกจัดขึ้นรถ" โดยไม่จัดรถให้ (เหมือน unmatched/:id/ignore) ───
+router.put('/unassigned-riders/:id/ignore', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+        const result = await PayrollEngine.ignoreUnassignedRider(id);
+        success(res, result, 'ลบออกจากรายการแล้ว');
+    } catch (err) {
+        console.error('❌ PUT /api/payroll/unassigned-riders/:id/ignore error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── GET Vehicle Rates ───
+router.get('/vehicle-rates', async (req, res) => {
+    try {
+        const { vehicleId, shiftCode, isActive } = req.query;
+        let query = `
+            SELECT vr.*, 
+                   v.displayNumber, v.plate, v.driver,
+                   st.shiftName
+            FROM PayrollVehicleRates vr
+            INNER JOIN Vehicles v ON vr.vehicleId = v.id
+            LEFT JOIN PayrollShiftTypes st ON vr.shiftCode = st.shiftCode
+            WHERE 1=1
+        `;
+        const params = {};
+
+        if (vehicleId) { 
+            query += ' AND vr.vehicleId = @vehicleId'; 
+            params.vehicleId = parseInt(vehicleId); 
+        }
+        if (shiftCode) { 
+            query += ' AND vr.shiftCode = @shiftCode'; 
+            params.shiftCode = shiftCode; 
+        }
+        if (isActive !== undefined) { 
+            query += ' AND vr.isActive = @isActive'; 
+            params.isActive = isActive === 'true' ? 1 : 0; 
+        }
+
+        query += ' ORDER BY vr.vehicleId, vr.shiftCode, vr.tripCount';
+        const result = await executeQuery(query, params);
+        success(res, result.recordset);
+    } catch (err) {
+        console.error('❌ GET /api/payroll/vehicle-rates error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── POST Vehicle Rates ───
+router.post('/vehicle-rates', async (req, res) => {
+    try {
+        const { vehicleId, shiftCode, tripCount, rate, effectiveDate, userId } = req.body;
+
+        if (!vehicleId || !shiftCode || rate === undefined) {
+            return badRequest(res, 'Missing required fields: vehicleId, shiftCode, rate');
+        }
+
+        const effectiveDateValue = effectiveDate || new Date().toISOString().split('T')[0];
+
+        // ✅ 1. ปิดอันเก่า
+        await executeQuery(`
+            UPDATE PayrollVehicleRates SET 
+                isActive = 0,
+                updatedAt = GETDATE()
+            WHERE vehicleId = @vehicleId 
+            AND shiftCode = @shiftCode 
+            AND tripCount = @tripCount
+            AND isActive = 1
+        `, { 
+            vehicleId: parseInt(vehicleId), 
+            shiftCode, 
+            tripCount: tripCount || null 
+        });
+
+        // ✅ 2. เพิ่มอันใหม่
+        const result = await executeQuery(`
+            INSERT INTO PayrollVehicleRates (
+                vehicleId, shiftCode, tripCount, rate, effectiveDate, isActive
+            ) OUTPUT INSERTED.id
+            VALUES (
+                @vehicleId, @shiftCode, @tripCount, @rate, @effectiveDate, 1
+            )
+        `, {
+            vehicleId: parseInt(vehicleId),
+            shiftCode,
+            tripCount: tripCount || null,
+            rate: parseFloat(rate),
+            effectiveDate: effectiveDateValue
+        });
+
+        const newId = result.recordset[0].id;
+
+        // ✅ 3. Audit Log
+        await executeQuery(`
+            INSERT INTO PayrollAuditLogs (tableName, recordId, fieldName, newValue, action, userId)
+            VALUES ('PayrollVehicleRates', @recordId, 'rate', @rate, 'INSERT', @userId)
+        `, { recordId: newId, rate: parseFloat(rate), userId: userId || 'system' });
+
+        const inserted = await executeQuery(
+            `SELECT * FROM PayrollVehicleRates WHERE id = @id`,
+            { id: newId }
+        );
+
+        success(res, inserted.recordset[0], 'บันทึกราคารถสำเร็จ');
+    } catch (err) {
+        console.error('❌ POST /api/payroll/vehicle-rates error:', err);
+        error(res, err.message);
+    }
+});
+
+// ─── DELETE Vehicle Rate ───
+router.delete('/vehicle-rates/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) {
+            return badRequest(res, 'Invalid id');
+        }
+
+        await executeQuery(`
+            UPDATE PayrollVehicleRates SET isActive = 0, updatedAt = GETDATE()
+            WHERE id = @id
+        `, { id });
+
+        success(res, null, 'ลบราคารถสำเร็จ');
+    } catch (err) {
+        console.error('❌ DELETE /api/payroll/vehicle-rates/:id error:', err);
+        error(res, err.message);
+    }
+});
+module.exports = router;
